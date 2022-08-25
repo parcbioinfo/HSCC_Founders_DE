@@ -1,0 +1,3434 @@
+---
+title: "Brain Gene Expression Differences Related to Ethanol Preference in the Collaborative Cross Founder Strains"
+date: "08/23/2022"
+output:
+  pdf_document:
+    df_print: kable
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    highlight: tango
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE,
+                      message = TRUE,
+                      tidy    = TRUE)
+```
+
+# Introduction and Initialization  
+
+Code necessary to recreate the analysis presented in the manuscript titled as 
+above, submitted to the special issue of Frontiers in Behavioral Neuroscience.  
+
+Analysis performed by:
+  Justin Anderson - andejust@ohsu.com
+  Priscila Darakjian - darakjia@ohsu.edu
+
+  Portland Alcohol Research Center
+  Department of Behavioral Neuroscience
+  Oregon Health & Science University and VA Portland Health Care System
+  Portland, OR, 97239
+  USA
+
+This code and and the files needed to run it are available at:
+https://github.com/parcbioinfo/HSCC_Founders_DE
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE212000
+
+This is the RNAseq project looking at different brain regions (CeA, NAcC and
+PrL) of the parental strains of the HS-CC mice (AJ, B6, CAST, NOD, NZO, PWK, 
+S129, WSB). It also includes data from the re-sequencing of samples from 
+library prep trays 2 and 3. Rerun 2 and original 3 are dropped for analysis to 
+minimize the impact of normalization. This analysis is condensed to that 
+contained in the manuscript, and creates figures and tables intended for the 
+paper and its supplements.  
+
+In general variables are camelCase, however selections or variations on a 
+single data frame are denoted by camelCase_camelCase  
+
+Change the flags below if you want to save figures or export tables
+```{r export flags}
+#Change these if you want to export figures or tables
+saveFigs_Flag <- 0
+exportTables_Flag <- 0 
+```
+
+## Libraries  
+
+We begin by loading the necessary libraries. All libraries used in analysis are 
+loaded here, however new libraries necessary for any given code chunk are shown
+at the beginning of each chunk. Code chunks are anticipated to be run
+sequentially, so "new library" here refers to any library needed for the current
+chunk which have not previously been loaded.
+
+```{r load libraries, echo=FALSE , results='hide'}
+#Core libraries
+library(edgeR)
+library(biomaRt)
+
+#Tidyverse
+library(plyr)
+library(tidyverse)
+
+#Plotting
+library(ggplot2)
+library(patchwork)
+library(ggrepel)
+library(ggpubr)
+library(ggstatsplot)
+library(gridExtra)
+library(ggdendro)
+library(VennDiagram)
+library(ggVennDiagram)
+library(ggthemes)
+library(cowplot)
+
+#Data export
+library(openxlsx) #Exporting lists as sheets
+library(readxl)
+```
+## Data Import  
+
+Load in the data used to perform the analysis. This includes sample annotations,
+as well as the raw star counts from alignment.  
+
+```{r gather data}
+# Set working directory to the file path directory. This likely will need to be
+# changed to work for you.
+setwd(dirname(rstudioapi::getActiveDocumentContext()$path))
+
+# Get the raw read file from the Gene Expression Omnibus, if we need it
+if (file.exists("HSCC_Founders_STAR_Counts.txt")) {
+  cat("Using existing RAW counts located in HSCC_Founders_STAR_Counts.txt.\n")
+} else {
+  cat("Loading RAW counts from Gene Expression Omnibus.\n")
+  tmpCountsFile <- tempfile()
+  download.file("https://www.ncbi.nlm.nih.gov/geo/download/?acc=GSE212000&format=file&file=GSE212000_HSCC_Founders_STAR_Counts.txt.gz",tmpCountsFile, mode="wb")
+  unzip(tmpCountsFile, "HSCC_Founders_STAR_Counts.txt")
+  unlink(tmpCountsFile)
+  rm(tmpCountsFile)
+}
+
+# read in raw data from tsv
+geneReadsOriginal = read.table("HSCC_Founders_STAR_Counts.txt",
+                               header = T, stringsAsFactors = F, 
+                               sep = "\t", row.names = 1)
+geneReadsOriginal <- geneReadsOriginal[, 4:ncol(geneReadsOriginal)]
+
+# Read in sample data (factors, phenotype, etc).
+phenotype <- read.csv("HSCC_Founders_Metadata.csv", 
+                       header=T, stringsAsFactors = F)
+
+geneReadsOriginal <-geneReadsOriginal[, order(names(geneReadsOriginal))]
+phenotype <- phenotype[order(phenotype$SampleID), ]
+
+# Double check to see the data frames are properly ordered
+cat("STAR sample infomation and sample factor files are sorted: ", 
+    all(colnames(geneReadsOriginal) == phenotype$SampleID),
+    "\n")
+```
+## Gather annotation  
+
+Gene annotation is loaded in order to add gene names to tables. Only genes in 
+chromosomes 1 through 20, X, and Y, will be included in the analysis. Annotation
+is loaded from biomart, then saved locally.  
+```{r annot}
+# library(biomaRt)
+if (file.exists("transcriptInfoMouse.RData")) {
+  cat("Using existing mouse gene annotation located in transciptInfoMouse.RData\n")
+  load("transcriptInfoMouse.RData")
+} else {
+  cat("Loading mouse gene annotation info via biomart.\n")
+  mart <- useMart(biomart = "ensembl", dataset = "mmusculus_gene_ensembl")
+  #listAttributes(mart)
+  transcriptInfoMouse=getBM(attributes=c("ensembl_gene_id",
+                                         "external_gene_name", 
+                                         "chromosome_name", 
+                                         "entrezgene_id",
+                                         "gene_biotype"), 
+                             mart=mart, useCache = FALSE)
+  save(transcriptInfoMouse, file="transcriptInfoMouse.RData")
+  rm(mart)
+}
+
+#Genes in our RNA-Seq data
+transcriptInfoMouse_Present <- transcriptInfoMouse %>%
+  filter(ensembl_gene_id %in% rownames(geneReadsOriginal))
+
+#Distinct genes
+transcriptInfoMouse_UniqueENS <- transcriptInfoMouse_Present %>%
+  distinct(ensembl_gene_id, .keep_all = TRUE)
+rownames(transcriptInfoMouse_UniqueENS) <-
+  transcriptInfoMouse_UniqueENS$ensembl_gene_id
+
+#Double check we only have genes in the RNA-Seq data
+tmp_commonENS <- 
+  intersect(rownames(transcriptInfoMouse_UniqueENS),
+            rownames(geneReadsOriginal))
+
+transcriptInfoMouse_EnsGene <- transcriptInfoMouse_UniqueENS[tmp_commonENS, ]
+
+cat("Only genes in chromosomes 1 through 20, X, and Y, will be",
+"included in the analysis.\n")
+transcriptInfoMouse_EnsGene <- transcriptInfoMouse_EnsGene %>% 
+  filter(chromosome_name %in% c(1:20, "X", "Y"))
+
+tmp_commonENS <- rownames(transcriptInfoMouse_EnsGene)
+ 
+# Keep track of all the genes we drop
+droppedGenes_Nonchrom <- data.frame(transcriptInfoMouse_UniqueENS) %>% 
+  filter(!(ensembl_gene_id %in% tmp_commonENS))
+
+cat(dim(droppedGenes_Nonchrom)[1], 
+     "genes dropped for not being on chromosomes 1-20, X or Y.\n")
+
+geneReadsOriginal <- 
+  geneReadsOriginal[rownames(geneReadsOriginal) %in% tmp_commonENS, ]
+```
+
+# Exploratory Data Analysis and Data Cleaning  
+
+Initial exploratory data analysis and execute data cleaning. We are looking for
+batch effects, outliers and eliminating genes based on low and high counts.  
+
+## Statistics  
+
+Top level statistics on raw sequencing data (all 5 trays)  
+```{r raw stats}
+#Stats
+statsPerSample <- 
+  data.frame(t(do.call(cbind, lapply(geneReadsOriginal, summary))))
+statsPerSample$zeros <- apply(geneReadsOriginal==0, 2, sum)
+statsPerSample$percent.zeros <-
+  100 * statsPerSample$zeros / nrow(geneReadsOriginal)
+statsPerSample$sums = colSums(geneReadsOriginal)
+
+#Sample info for plotting
+statsPerSample$LibraryPrepBatch <- 
+  factor(phenotype$LibraryPrepBatch,
+  levels = c("1", "2", "3", "2_rerun", "3_rerun"))
+statsPerSample$BrainRegion <- factor(phenotype$BrainRegion)
+statsPerSample$Genotype <- factor(phenotype$Genotype)
+statsPerSample$Sex <- factor(phenotype$Sex)
+```
+### Plots: Original 3 Sequencing Trays  
+
+Exploratory data analysis of library prep batches 1, 2, 3. Tray 3 is identified
+as having significantly lower mean total counts per sample. This led to tray 3 
+being resequenced along with tray 2 for as a common reference.
+```{r batch effect plots original}
+# library(ggplot2)
+# library(ggstatsplot)
+# library(patchwork)
+
+tmp_PlottingData <- statsPerSample %>%
+  filter(LibraryPrepBatch %in% c(1, 2, 3))
+tmp_phenotype <- phenotype$LibraryPrepBatch %in% c(1, 2, 3)
+
+tmp_plot0 <- ggbetweenstats(
+  data = tmp_PlottingData %>% mutate(sums = sums / 10^6),
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "s",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  #var.equal = TRUE,
+  plot.type = "violin",
+  ggtheme = theme_classic()
+) + xlab("Library prep batch") + ylab("Total Gene Counts (millions)")
+
+#PCA Original 3 batches
+tmp_pcaRes <- prcomp(t(geneReadsOriginal[, tmp_phenotype]))
+tmp_importance <- summary(tmp_pcaRes)$importance
+tmp_importance[, 1:5]
+
+tmp_plot1 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1],
+             y = tmp_pcaRes$x[, 2], 
+             color = Genotype)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot2 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = Sex)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot3 <-
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = BrainRegion)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)  
+
+tmp_plot4 <-
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = LibraryPrepBatch)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)
+
+tmp_plot1 <- tmp_plot1 + 
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot2 <- tmp_plot2 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot4 <- tmp_plot4 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot3 <- tmp_plot3 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+(tmp_plot0 + wrap_plots(tmp_plot4, tmp_plot3, tmp_plot1, tmp_plot2)) +
+  plot_annotation(tag_levels = 'A', title = "Initial Sequencing",
+                  caption = "(Note) bars are only shown for SIGNIFICANT 
+                   pairwise comparisons for clarity.") &
+  scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+
+#Cleanup tmps
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+### Plots: All Sequencing Trays  
+
+Exploratory data analysis of all sequencing data, including reruns of trays 2
+and 3. Tray 3_rerun is seen to be more consistent in mean total counts per 
+sample to the original trays 1 and 2. Tray 2_rerun is now significantly higher 
+than remaining trays. mean(2):mean(3) and mean(2_rerun):mean(3_rerun) ratios 
+are reasonably consistent.  Biological replicates are highly correlated.
+```{r batch effect plots all}
+tmp_PlottingData <- statsPerSample
+
+tmp_plot0 <- ggbetweenstats(
+  data = tmp_PlottingData %>% mutate(sums = sums / 10^6),
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "ns",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  #var.equal = TRUE,
+  plot.type = "violin",
+  ggtheme = theme_classic()
+) + xlab("Library prep batch") +ylab("Total Gene Counts (millions)")
+
+tmp_pcaRes <- prcomp(t(geneReadsOriginal))
+tmp_importance <-summary(tmp_pcaRes)$importance
+tmp_importance[, 1:5]
+
+tmp_plot1 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1],
+             y = tmp_pcaRes$x[, 2], 
+             color = Genotype)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)   
+
+tmp_plot2 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = Sex ) ) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)   
+
+tmp_plot3 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1],
+             y = tmp_pcaRes$x[, 2], 
+             color = BrainRegion ) ) +
+ geom_point(size = 2, alpha = 0.5, shape = 16)   
+
+tmp_plot4 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = LibraryPrepBatch ) ) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)  
+
+tmp_plot1 <- tmp_plot1 + 
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot2 <- tmp_plot2 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot4 <- tmp_plot4 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot3 <- tmp_plot3 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+(tmp_plot0 + wrap_plots(tmp_plot4, tmp_plot3, tmp_plot1, tmp_plot2)) +
+  plot_annotation( tag_levels = 'A', title = "All Sequencing",
+                   caption = "(Note) bars are only shown for NON-SIGNIFICANT 
+                   pairwise comparisons for clarity.") &
+  scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+
+tmp_means <- statsPerSample %>%
+  group_by(LibraryPrepBatch) %>%
+  summarize_if(is.numeric,mean)
+
+cat("Ratio of mean total sums for library prep batches 2:3 is",
+     tmp_means[[2, "sums"]] / tmp_means[[3, "sums"]], "\n")
+cat("Ratio of mean total sums for library prep batches 2_rerun:3_rerun is",
+     tmp_means[[4, "sums"]] / tmp_means[[5, "sums"]],"\n")
+
+cat("Excluding PC1 (associated with batch), biological replicates from batch 2
+    and batch 2_rerun are highly correlated (>0.99):\n")
+cor(
+  tmp_pcaRes$x[phenotype$LibraryPrepBatch==2, 2:10],
+  tmp_pcaRes$x[phenotype$LibraryPrepBatch=="2_rerun", 2:10]
+  ) %>% diag 
+cat("Excluding PC1 (associated with batch), biological replicates from batch 3
+    and batch 3_rerun are highly correlated (>0.99):\n")
+cor(
+  tmp_pcaRes$x[phenotype$LibraryPrepBatch==3, 2:10],
+  tmp_pcaRes$x[phenotype$LibraryPrepBatch=="3_rerun", 2:10]
+  ) %>% diag
+
+#Cleanup tmps
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Final Sequencing  
+
+Looking at the sequencing runs which we use for analsys: 1,2 and 3_rerun. 
+Limma-voom normalization explicitly accounts for this sort sample-level 
+variation in mean counts, but chosing the trays with the least variation will
+minimize the overall effect on analysis by, in a sense, "maximizing signal to 
+noise".  
+```{r drop prepbatches}
+#We want to replace 3 with 3_rerun and drop 2_rerun and verify we are still in the right order
+tmp_drop <-
+  phenotype[phenotype$LibraryPrepBatch %in% c("2_rerun", "3"), "SampleID"]
+geneReadsOriginal <- 
+  geneReadsOriginal[, !(colnames(geneReadsOriginal) %in% tmp_drop)]
+phenotype <- phenotype[!(phenotype$SampleID %in% tmp_drop), ]
+
+cat("STAR raw gene count and sample factor files are sorted: ", 
+    all(phenotype$SampleID == colnames(geneReadsOriginal)),
+    "\n")
+
+#Cleanup variables we do not need anymore
+rm(transcriptInfoMouse_Present,
+   transcriptInfoMouse_UniqueENS,
+   tmp_drop)
+```
+### Statistics  
+
+Top level statistics on our selected sequencing runs.  
+```{r summary.stats}
+#Stats after selecting final sequencing data
+statsPerSample <- 
+  data.frame(t(do.call(cbind, lapply(geneReadsOriginal, summary))))
+statsPerSample$zeros <- apply(geneReadsOriginal==0, 2, sum)
+statsPerSample$percent.zeros <-
+  100 * statsPerSample$zeros / nrow(geneReadsOriginal)
+statsPerSample$sums = colSums(geneReadsOriginal)
+
+#Sample info for plotting
+statsPerSample$LibraryPrepBatch <- 
+  factor(phenotype$LibraryPrepBatch,
+  levels = c("1", "2", "3_rerun"))
+statsPerSample$BrainRegion <- factor(phenotype$BrainRegion)
+statsPerSample$Genotype <- factor(phenotype$Genotype)
+statsPerSample$Sex <- factor(phenotype$Sex)
+```
+#### Plots: Selected Sequencing  
+
+Exploratory data analysis on our selected sequencing runs.  
+```{r batch effect plots final}
+tmp_PlottingData <- statsPerSample
+
+tmp_plot0 <- ggbetweenstats(
+  data = tmp_PlottingData %>% mutate(sums = sums / 10^6) ,
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "ns",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  #var.equal = TRUE,
+  plot.type = "violin",
+  ggtheme = theme_classic()
+) + xlab("Library prep batch") +ylab("Total Gene Counts (millions)")
+
+#PCA Original 3
+tmp_pcaRes <- prcomp(t(geneReadsOriginal))
+tmp_importance <- summary(tmp_pcaRes)$importance
+tmp_importance[, 1:5]
+
+tmp_plot1 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1],
+             y = tmp_pcaRes$x[, 2], 
+             color = Genotype)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot2 <- 
+  ggplot(tmp_PlottingData,
+         aes(x=tmp_pcaRes$x[, 1], 
+             y=tmp_pcaRes$x[, 2], 
+             color=Sex)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot3 <- 
+  ggplot(tmp_PlottingData,
+         aes(x=tmp_pcaRes$x[, 1], 
+             y=tmp_pcaRes$x[, 2], 
+             color=BrainRegion)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)   
+
+tmp_plot4 <- 
+  ggplot(tmp_PlottingData,
+         aes(x=tmp_pcaRes$x[, 1],
+             y=tmp_pcaRes$x[, 2],
+             color=LibraryPrepBatch)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot1 <- tmp_plot1 + 
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ",tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot2 <- tmp_plot2 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot4 <- tmp_plot4 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot3 <- tmp_plot3 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+(tmp_plot0 + wrap_plots(tmp_plot4, tmp_plot3, tmp_plot1, tmp_plot2)) +
+  plot_annotation(tag_levels = 'A', title = "Selected Sequencing",
+                   caption = "(Note) bars are only shown for NON-SIGNIFICANT 
+                   pairwise comparisons for clarity.") &
+  scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+
+#Cleanup tmps
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+###Data cleaning  
+
+Below we see that there are extremely high read counts for some genes. those are
+likely to be PCR artifacts from library preparation. We also see the presence of
+genes with zero counts throughout. We will remove those in the process of 
+filtering out genes with 1 count-per-million or less in average across samples.  
+
+Here we do our initial data cleaning, throwing out outliers and genes with high 
+and low counts. NOTE: CPM is one form of counts normalization where we divide
+the sum of all counts for each gene by the total gene counts for the sample 
+(which corrects for sequencing depth in each sample) and multiply the result 
+by 1 million (to provide a more convenient number).  
+
+```{r cleaning tmps}
+# library(edgeR)
+# Get counts-per-million
+tmp_geneCPM <- apply(as.matrix(geneReadsOriginal), 2,
+                         function(x) (x / sum(x)) * 1000000)
+
+# Enter the counts into a DGEList object using the function DGEList in edgeR
+tmp_DGEList <- DGEList(geneReadsOriginal)
+
+```
+#### Filter out low read counts  
+
+Number of genes remaining after removing those with counts below 1 cpm threshold  
+
+```{r filter}
+###########################################################################################################
+# Select genes given a cpm threshold 
+# Remove reads below 1 cpmin average across samples using the min library size:
+cpmThresh <- 1
+
+selectedGenes <- 
+  tmp_geneCPM[(rowSums(tmp_geneCPM) / ncol(tmp_geneCPM)) >= cpmThresh, ]
+
+geneCountsSelected <-  geneReadsOriginal[
+  rownames(geneReadsOriginal[, ]) %in% row.names(selectedGenes), ]
+
+#Keep track of all the genes we drop
+droppedGenes_Lowcount <- data.frame(transcriptInfoMouse_EnsGene) %>% 
+  filter(!(ensembl_gene_id %in% rownames(geneCountsSelected))) 
+
+cat(dim(droppedGenes_Lowcount)[1], "genes dropped for low counts,",
+    length(rownames(geneCountsSelected)), "remain.\n")
+
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+rm(cpmThresh)
+###########################################################################################################
+```
+#### Drop aberrantly high counts genes  
+
+Basic stats after low and extremely high counts genes removal  
+
+```{r drop.aberrant.genes}
+tmp_drop <- rownames(geneCountsSelected[apply(geneCountsSelected,
+                                          1,
+                                          function(x) any(x >= 50000)), ])
+tmp_ndrop <- length(tmp_drop)
+cat(paste("There are", tmp_ndrop, 
+          "genes with equal or above 50,000 read counts in any sample in the",
+          "sequencing data.\n"))
+geneCountsSelected<-
+  geneCountsSelected[!(rownames(geneCountsSelected) %in% tmp_drop),]
+droppedGenes_Highcount <- data.frame(transcriptInfoMouse_EnsGene) %>% 
+  filter(ensembl_gene_id %in% tmp_drop) 
+```
+#### Preliminary inspection for outlier samples  
+
+Here we borrow ISC (Inter-Array Correlation) utilized in microarray studies. We
+will call it here "Inter Sample Correlation (ISC)", defined as the Pearson 
+correlation coefficient of the read counts for a given pair of samples. This 
+makes sure that we detect samples with divergent expression levels. A histogram 
+is used to visualize the distribution of the coefficients, while a dendogram
+(product of the average linkage hierarchical clustering with 1-ISC as a distant
+metric) is generated to visualize the relationship between samples.  
+
+```{r iac}
+###########################################################################################################
+par(mfrow = c(1, 3))
+tmp_ISC <- cor(geneCountsSelected,method="p") 
+hist(tmp_ISC,
+     sub = paste("Mean=", format(mean(tmp_ISC[upper.tri(tmp_ISC)]), digits=3))) 
+tmp_cluster <- hclust(as.dist(1-tmp_ISC), method="average") 
+plot(tmp_cluster, cex=0.7, labels=dimnames(geneCountsSelected)[[2]]) 
+tmp_meanISC <- apply(tmp_ISC, 2, mean) 
+tmp_sdCorr <- sd(tmp_meanISC) 
+tmp_numbersd <- (tmp_meanISC-mean(tmp_meanISC)) / tmp_sdCorr 
+plot(tmp_numbersd, ylim=c(-10, 2), main="Inter Sample Correlations")
+abline(h = -3) 
+tmp_sdout <- -3.5 
+tmp_outliers <- dimnames(geneCountsSelected)[[2]][tmp_numbersd < tmp_sdout]
+cat("Outliers:", tmp_outliers, "\n")
+
+cat("We will remove sample", tmp_outliers, "from the data.")
+geneCountsSelected <- geneCountsSelected %>% 
+  data.frame() %>%
+  select( !c(tmp_outliers) )
+
+sampleNames <- sampleNames %>%
+  data.frame() %>%
+  filter(!(SampleID %in% c(tmp_outliers)))
+    
+phenotype <- phenotype %>%
+  data.frame() %>%
+  filter(!(SampleID %in% c(tmp_outliers)))
+
+cat("Selected Gene Counts and sample factor files are sorted: ", 
+    all(phenotype$SampleID == colnames(geneCountsSelected)),
+    "\n")
+
+par(mfrow = c(1, 1))
+#Cleanup tmps
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+### Post cleaning Statistics  
+
+Top level stats after all drops  
+
+```{r post_drop_stats}
+statsPerSample_2 <- 
+  data.frame(t(do.call(cbind, lapply(geneCountsSelected, summary))))
+statsPerSample_2$zeros <- apply(geneCountsSelected==0, 2, sum)
+statsPerSample_2$percent.zeros <-
+  100 * statsPerSample_2$zeros / nrow(geneCountsSelected)
+statsPerSample_2$sums = colSums(geneCountsSelected)
+
+statsPerSample_2$LibraryPrepBatch <- 
+  factor(phenotype$LibraryPrepBatch,
+  levels = c("1", "2", "3_rerun"))
+statsPerSample_2$BrainRegion <- factor(phenotype$BrainRegion)
+statsPerSample_2$Genotype <- factor(phenotype$Genotype)
+statsPerSample_2$Sex <- factor(phenotype$Sex)
+```
+#### Plot: Post cleaning
+```{r post_drop_stats_plots}
+tmp_PlottingData <- statsPerSample_2
+
+tmp_plot0 <- ggbetweenstats(
+  data = tmp_PlottingData %>% mutate(sums = sums / 10^6) ,
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "ns",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  #var.equal = TRUE,
+  plot.type = "violin",
+  ggtheme = theme_classic()
+) + xlab("Library prep batch") +ylab("Total Gene Counts (millions)")
+
+tmp_pcaRes <- prcomp(t(geneCountsSelected))
+tmp_importance <- summary(tmp_pcaRes)$importance
+tmp_importance[, 1:5]
+
+tmp_plot1 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = Genotype)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot2 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = Sex)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot3 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = BrainRegion)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)  
+
+tmp_plot4 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[, 1], 
+             y = tmp_pcaRes$x[, 2], 
+             color = LibraryPrepBatch)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot1 <- tmp_plot1 + 
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste( "PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot2 <- tmp_plot2 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste( "PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot4 <- tmp_plot4 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste( "PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot3 <- tmp_plot3 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste( "PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+(tmp_plot0 + wrap_plots(tmp_plot4, tmp_plot3, tmp_plot1, tmp_plot2)) +
+  plot_annotation(tag_levels = 'A', title = "Post Drops",
+                   caption = "(Note) bars are only shown for NON-SIGNIFICANT 
+                   pairwise comparisons for clarity.") &
+  scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+
+#Cleanup tmps
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+#Differential Expression Analaysis  
+
+Differential expression analysis on the lines across the brain regions. We begin
+by separating our samples into groups.  
+
+```{r separate.groups}
+#Divide samples in groups 
+samples_CAST<-phenotype[phenotype$Genotype %in% c("CAST"), "SampleID"]
+samples_NOD<-phenotype[phenotype$Genotype %in% c("NOD"), "SampleID"]
+samples_NZO<-phenotype[phenotype$Genotype %in% c("NZO"), "SampleID"]
+samples_WSB<-phenotype[phenotype$Genotype %in% c("WSB"), "SampleID"]
+samples_AJ<-phenotype[phenotype$Genotype %in% c("AJ"), "SampleID"]
+samples_PWK<-phenotype[phenotype$Genotype %in% c("PWK"), "SampleID"]
+samples_B6<-phenotype[phenotype$Genotype %in% c("B6"), "SampleID"]
+samples_S129<-phenotype[phenotype$Genotype %in% c("S129"), "SampleID"]
+
+samples_CeA<-phenotype[phenotype$BrainRegion %in% c("CeA"), "SampleID"]
+samples_PrL<-phenotype[phenotype$BrainRegion %in% c("PrL"), "SampleID"]
+samples_NAcc<-phenotype[phenotype$BrainRegion %in% c("NAcc"), "SampleID"]
+
+samples_F<-phenotype[phenotype$Sex %in% c("female"), "SampleID"]
+samples_M<-phenotype[phenotype$Sex %in% c("male"), "SampleID"]
+```
+##DE All  
+
+Differential expression using all three brain regions  
+
+```{r Initial DE of all samples}
+#Double checking ordering
+cat("Gene counts and factor data is still ordered: ",
+    all(names(geneCountsSelected) == phenotype$SampleID),
+        "\n")
+
+d_all <- DGEList( counts = geneCountsSelected,
+                  genes = rownames(geneCountsSelected) )
+
+d_all$genes$Symbol <-   transcriptInfoMouse_EnsGene[
+  match(rownames(d_all), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "external_gene_name"]
+d_all$genes$id <- transcriptInfoMouse_EnsGene[
+  match(rownames(d_all), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "entrezgene_id"]
+
+#TMM Normalization
+d_all <- calcNormFactors(d_all)
+
+design_all <- model.matrix(~0 + as.factor(phenotype$Genotype) +
+                           as.factor(phenotype$LibraryPrepBatch) +
+                           as.factor(phenotype$Sex))
+#colnames(design_all)
+colnames(design_all) <- 
+  c("AJ", "B6", "CAST", "NOD", "NZO", "PWK", "S129", "WSB",
+    "Batch2", "Batch3", "Sex")
+
+# This contains every pairwise comparison, so has redundancy, note that here
+# AvB = B-A, so up/down is relative to "B".  We do all possible comparisons here
+# rather than just 28, as it doesn't change the statistics in decideTests with
+# method = "global" to include both B-A and A-B.  It makes it easier to pull
+# together the plots later.
+contrMatrix_all <- makeContrasts(
+                 B6vAJ   = AJ - B6,
+                 CASTvAJ = AJ-CAST,
+                 NODvAJ = AJ-NOD,
+                 NZOvAJ = AJ-NZO,
+                 PWKvAJ = AJ-PWK,
+                 S129vAJ = AJ-S129,
+                 WSBvAJ = AJ-WSB,
+  
+                 AJvB6=B6 - AJ,
+                 CASTvB6=B6-CAST,
+                 NODvB6=B6-NOD,
+                 NZOvB6=B6-NZO,
+                 PWKvB6=B6-PWK,
+                 S129vB6=B6-S129,
+                 WSBvB6=B6-WSB,
+                
+                 AJvCAST = CAST-AJ,
+                 B6vCAST = CAST-B6,
+                 NODvCAST = CAST-NOD,
+                 NZOvCAST = CAST-NZO,
+                 PWKvCAST = CAST-PWK,
+                 S129vCAST = CAST-S129,
+                 WSBvCAST = CAST-WSB,
+                 
+                 AJvNOD = NOD - AJ,
+                 B6vNOD = NOD - B6,
+                 CASTvNOD = NOD-CAST,
+                 NZOvNOD = NOD-NZO,
+                 PWKvNOD = NOD-PWK,
+                 S129vNOD = NOD-S129,
+                 WSBvNOD = NOD-WSB,
+                 
+                 AJvNZO = NZO - AJ,
+                 B6vNZO = NZO - B6,
+                 CASTvNZO = NZO - CAST,
+                 NODvNZO = NZO - NOD,
+                 PWKvNZO = NZO-PWK,
+                 S129vNZO = NZO-S129,
+                 WSBvNZO = NZO-WSB,
+                 
+                 AJvPWK = PWK - AJ,
+                 B6vPWK = PWK - B6,
+                 CASTvPWK = PWK - CAST,
+                 NODvPWK = PWK - NOD,
+                 NZOvPWK = PWK - NZO,
+                 S129vPWK = PWK - S129,
+                 WSBvPWK = PWK - WSB,
+                 
+                 AJvS129 = S129 - AJ,
+                 B6vS129 = S129 - B6,
+                 CASTvS129 = S129 - CAST,
+                 NODvS129 = S129 - NOD,
+                 NZOvS129 = S129 - NZO,
+                 PWKvS129 = S129 - PWK,
+                 WSBvS129 = S129 - WSB,
+                 
+                 AJvWSB = WSB - AJ,
+                 B6vWSB = WSB - B6,
+                 CASTvWSB = WSB - CAST,
+                 NODvWSB = WSB - NOD,
+                 NZOvWSB = WSB - NZO,
+                 PWKvWSB = WSB - PWK ,
+                 S129vWSB = WSB - S129,
+                 
+                 levels=colnames(design_all))
+
+contrMatrix_B6 <- makeContrasts(
+                 AJvB6   = B6 - AJ,
+                 CASTvB6=B6-CAST,
+                 NODvB6=B6-NOD,
+                 NZOvB6=B6-NZO,
+                 PWKvB6=B6-PWK,
+                 S129vB6=B6-S129,
+                 WSBvB6=B6-WSB,
+                 
+                 levels=colnames(design_all))
+
+v_all <- voom(d_all, design_all, plot=FALSE) 
+vfit_all <- lmFit(v_all, design_all)
+vfit_all_B6 <- contrasts.fit(vfit_all, contrasts = contrMatrix_B6)
+vfit_all <- contrasts.fit(vfit_all, contrasts = contrMatrix_all)
+efit_all <- eBayes(vfit_all)
+efit_all_B6 <- eBayes(vfit_all_B6)
+summary(decideTests(efit_all, method='global'))
+summary(decideTests(efit_all_B6, method='global'))
+
+tfit_all <- treat(vfit_all, lfc=1)
+dt_all <- decideTests(tfit_all, method='global')
+summary(dt_all)
+```
+## DE CeA  
+```{r DE of CeA}
+geneCountsSelected_CeA <- geneCountsSelected %>%
+  select(all_of(samples_CeA))
+phenotype_CeA <- phenotype %>%
+  filter( SampleID %in% samples_CeA )
+cat("CeA: Gene counts and factor data is still ordered: ",
+    all(names(geneCountsSelected_CeA) == phenotype_CeA$SampleID),
+        "\n")
+
+d_CeA <- DGEList(counts = geneCountsSelected_CeA)
+d_CeA$genes$Symbol <-  transcriptInfoMouse_EnsGene[
+  match(rownames(d_CeA), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "external_gene_name"]
+d_CeA$genes$id <- transcriptInfoMouse_EnsGene[
+  match(rownames(d_CeA), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "entrezgene_id"]
+
+d_CeA<-calcNormFactors(d_CeA)
+
+design_CeA <- model.matrix(~0 + as.factor(phenotype_CeA$Genotype) +  as.factor(phenotype_CeA$LibraryPrepBatch) + as.factor(phenotype_CeA$Sex))
+
+colnames(design_CeA) <- 
+  c("AJ", "B6", "CAST", "NOD", "NZO", "PWK", "S129", "WSB", 
+    "Batch2", "Batch3", "Sex")
+
+v_CeA <- voom(d_CeA, design_CeA, plot=FALSE)
+vfit_CeA <- lmFit(v_CeA, design_CeA)
+vfit_CeA_B6 <- contrasts.fit(vfit_CeA, contrasts = contrMatrix_B6)
+vfit_CeA <- contrasts.fit(vfit_CeA, contrasts = contrMatrix_all)
+efit_CeA <- eBayes(vfit_CeA)
+efit_CeA_B6 <-eBayes(vfit_CeA_B6)
+summary(decideTests(efit_CeA, method='global'))
+summary(decideTests(efit_CeA_B6, method='global'))
+
+tfit_CeA <- treat(vfit_CeA, lfc=1)
+tfit_CeA_B6 <- treat(vfit_CeA_B6, lfc=1)
+dt_CeA <- decideTests(tfit_CeA, method='global')
+summary(dt_CeA)
+```
+## DE NAcc  
+```{r Initial DE of nacc}
+geneCountsSelected_NAcc <- geneCountsSelected %>%
+  select(all_of(samples_NAcc))
+phenotype_NAcc <- phenotype %>%
+  filter( SampleID %in% samples_NAcc )
+cat("NAcc: Gene counts and factor data is still ordered: ",
+    all(names(geneCountsSelected_NAcc) == phenotype_NAcc$SampleID),
+        "\n")
+
+d_NAcc <- DGEList(counts= geneCountsSelected_NAcc)
+d_NAcc$genes$Symbol <-  transcriptInfoMouse_EnsGene[
+  match(rownames(d_NAcc), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "external_gene_name"]
+d_NAcc$genes$id <- transcriptInfoMouse_EnsGene[
+  match(rownames(d_NAcc), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "entrezgene_id"]
+
+d_NAcc <-calcNormFactors(d_NAcc)
+
+design_NAcc <-model.matrix(~0 + 
+                             factor(phenotype_NAcc$Genotype) + 
+                             factor(phenotype_NAcc$LibraryPrepBatch) + 
+                             factor(phenotype_NAcc$Sex))
+colnames(design_NAcc) <- 
+  c("AJ", "B6", "CAST", "NOD", "NZO", "PWK", "S129", "WSB",
+    "Batch2", "Batch3", "Sex")
+
+v_NAcc <- voom(d_NAcc, design_NAcc, plot=FALSE)
+vfit_NAcc <- lmFit(v_NAcc, design_NAcc)
+vfit_NAcc_B6 <- contrasts.fit(vfit_NAcc, contrasts = contrMatrix_B6)
+vfit_NAcc <- contrasts.fit(vfit_NAcc, contrasts = contrMatrix_all)
+efit_NAcc <- eBayes(vfit_NAcc)
+efit_NAcc_B6 <- eBayes(vfit_NAcc_B6)
+summary(decideTests(efit_NAcc, method='global'))
+summary(decideTests(efit_NAcc_B6, method='global'))
+
+tfit_NAcc <- treat(vfit_NAcc, lfc=1)
+tfit_NAcc_B6 <- treat(vfit_NAcc_B6, lfc=1)
+dt_NAcc <- decideTests(tfit_NAcc, method='global')
+summary(dt_NAcc)
+```
+## DE PrL  
+```{r Initial DE of prl}
+geneCountsSelected_PrL <- geneCountsSelected %>%
+  select(all_of(samples_PrL))
+phenotype_PrL <- phenotype %>%
+  filter( SampleID %in% samples_PrL )
+cat("PrL: Gene counts and factor data is still ordered: ",
+    all(names(geneCountsSelected_PrL) == phenotype_PrL$SampleID),
+        "\n")
+
+d_PrL <- DGEList(counts= geneCountsSelected_PrL)
+d_PrL$genes$Symbol <-  transcriptInfoMouse_EnsGene[
+  match(rownames(d_PrL), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "external_gene_name"]
+d_PrL$genes$id <- transcriptInfoMouse_EnsGene[
+  match(rownames(d_PrL), transcriptInfoMouse_EnsGene$ensembl_gene_id),
+  "entrezgene_id"]
+
+d_PrL <- calcNormFactors(d_PrL)
+
+design_PrL <- model.matrix(~0 + factor(phenotype_PrL$Genotype) +
+                           factor(phenotype_PrL$LibraryPrepBatch) + 
+                           factor(phenotype_PrL$Sex))
+colnames(design_PrL) <- c("AJ", "B6", "CAST", "NOD", "NZO", "PWK", "S129", "WSB",
+                       "Batch2", "Batch3", "Sex")
+
+
+v_PrL <- voom(d_PrL,design_PrL,plot=FALSE)
+vfit_PrL <- lmFit(v_PrL, design_PrL)
+vfit_PrL_B6 <- contrasts.fit(vfit_PrL, contrasts = contrMatrix_B6)
+vfit_PrL <- contrasts.fit(vfit_PrL, contrasts = contrMatrix_all)
+efit_PrL <- eBayes(vfit_PrL)
+efit_PrL_B6 <- eBayes(vfit_PrL_B6)
+summary(decideTests(efit_PrL, method='global'))
+summary(decideTests(efit_PrL_B6, method='global'))
+
+tfit_PrL <- treat(vfit_PrL, lfc=1)
+tfit_PrL_B6 <- treat(vfit_PrL_B6, lfc=1)
+dt_PrL <- decideTests(tfit_PrL, method='global')
+summary(dt_PrL)
+```
+## DE High vs Low Drinkers  
+```{r DE Contrasts}
+contrMatrix_vs <- makeContrasts(
+                
+                 B6vsLow   = B6 - (AJ+S129+NOD+NZO+CAST+WSB) / 6,
+                 PWKvsLow   = PWK - (AJ+S129+NOD+NZO+CAST+WSB) / 6,
+                 DrinkersvsLow = (PWK+B6)/2 - (AJ+S129+NOD+NZO+CAST+WSB)/6 ,
+
+                 levels=colnames(design_all))
+
+vfit_drinkers_CeA <- lmFit(v_CeA, design_CeA)
+vfit_drinkers_CeA <- contrasts.fit(vfit_drinkers_CeA,
+                                   contrasts = contrMatrix_vs)
+efit_drinkers_CeA <- eBayes(vfit_drinkers_CeA)
+summary(decideTests(efit_drinkers_CeA,method='global')) 
+
+tfit_drinkers_CeA <- treat(vfit_drinkers_CeA, lfc=1)
+summary(decideTests(tfit_drinkers_CeA,method='global'))
+
+vfit_drinkers_NAcc <- lmFit(v_NAcc, design_NAcc)
+vfit_drinkers_NAcc <- contrasts.fit(vfit_drinkers_NAcc,
+                                    contrasts = contrMatrix_vs )
+efit_drinkers_NAcc <- eBayes(vfit_drinkers_NAcc)
+summary(decideTests(efit_drinkers_NAcc,method='global'))
+summary(decideTests(efit_drinkers_NAcc[,3],method='global'))
+tfit_drinkers_NAcc <- treat(vfit_drinkers_NAcc, lfc=1)
+summary(decideTests(tfit_drinkers_NAcc,method='global'))
+
+
+vfit_drinkers_PrL <- lmFit(v_PrL, design_PrL)
+vfit_drinkers_PrL <- contrasts.fit(vfit_drinkers_PrL,
+                                   contrasts = contrMatrix_vs )
+efit_drinkers_PrL <- eBayes(vfit_drinkers_PrL)
+summary(decideTests(efit_drinkers_PrL,method='global'))
+
+tfit_drinkers_PrL <- treat(vfit_drinkers_PrL, lfc=1)
+summary(decideTests(tfit_drinkers_PrL,method='global'))
+
+```
+## Statistics on voom/limma normalized (TMM) samples  
+```{r}
+##VOOM normalized counts
+normalized_all <- as.data.frame(v_all$E)
+
+statsPerSample_3 <- 
+  data.frame(t(do.call(cbind, lapply(normalized_all, summary))))
+statsPerSample_3$zeros <- apply(normalized_all==0, 2, sum)
+statsPerSample_3$percent.zeros <-
+  100 * statsPerSample_2$zeros / nrow(normalized_all)
+statsPerSample_3$sums = colSums(normalized_all)
+
+statsPerSample_3$LibraryPrepBatch <- 
+  factor(phenotype$LibraryPrepBatch,
+  levels = c("1", "2", "3_rerun"))
+statsPerSample_3$BrainRegion <- factor(phenotype$BrainRegion)
+statsPerSample_3$Genotype <- factor(phenotype$Genotype)
+statsPerSample_3$Sex <- factor(phenotype$Sex)
+```
+### Plots: Normalized  
+```{r stats.final.plots}
+tmp_PlottingData <- statsPerSample_3
+
+tmp_plot0 <- ggbetweenstats(
+  data = tmp_PlottingData %>% mutate(sums = sums/10^6) ,
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "s",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  #var.equal = TRUE,
+  plot.type = "violin",
+  ggtheme = theme_classic()
+) + xlab("Library prep batch") +ylab("Total Gene Counts (millions)")
+
+tmp_pcaRes <- prcomp(t(normalized_all))
+tmp_importance <- summary(tmp_pcaRes)$importance
+tmp_importance[, 1:5]
+
+tmp_plot1 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[,1], 
+             y = tmp_pcaRes$x[,2], 
+             color = Genotype)) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot2 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[,1], 
+             y = tmp_pcaRes$x[,2], 
+             color = Sex ) ) +
+  geom_point(size = 2, alpha = 0.5, shape = 16) 
+
+tmp_plot3 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[,1], 
+             y = tmp_pcaRes$x[,2], 
+             color = BrainRegion ) ) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)  
+
+tmp_plot4 <- 
+  ggplot(tmp_PlottingData,
+         aes(x = tmp_pcaRes$x[,1], 
+             y = tmp_pcaRes$x[,2], 
+             color = LibraryPrepBatch ) ) +
+  geom_point(size = 2, alpha = 0.5, shape = 16)
+
+tmp_plot1 <- tmp_plot1 + 
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot2 <- tmp_plot2 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot4 <- tmp_plot4 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+tmp_plot3 <- tmp_plot3 +
+  xlab(paste("PC1 ", tmp_importance[2, 1]*100, "%")) + 
+  ylab(paste("PC2 ", tmp_importance[2, 2]*100, "%")) +
+  theme_classic() +
+  theme(axis.text.x  = element_blank(), axis.text.y  = element_blank(),
+        axis.ticks.x = element_blank(), axis.ticks.y = element_blank())
+
+(tmp_plot0 + wrap_plots( tmp_plot4, tmp_plot3, tmp_plot1, tmp_plot2)) +
+  plot_annotation(tag_levels = 'A', title = "Normalized Counts",
+                   caption = "(Note) bars are only shown for SIGNIFICANT 
+                   pairwise comparisons for clarity.")&
+  scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+
+#Cleanup tmps
+rm(list=ls(pattern= "tmp", all.names = TRUE))
+
+```
+# Gather Plotting data and Functions  
+
+Gathering/wrangling data into forms needed for plotting, as well as functions
+written to help plotting  
+
+## Pairwise DE counts  
+
+```{r Build plotting data pairwise comparisons}
+#Pairwise differential expression counts using decideTests, method='global.
+#We pull out all the up/down numbers
+tmp_plottingData <- rbind( 
+  summary(decideTests(efit_CeA, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "CeA" ) %>%
+  rownames_to_column("Comparison"),
+  summary(decideTests(efit_NAcc, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "NAcc" ) %>%
+  rownames_to_column("Comparison"),
+  summary(decideTests(efit_PrL, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "PrL" ) %>%
+  rownames_to_column("Comparison")
+)
+
+#Pull out the AvsB from the comparison labels.
+plottingData <- tmp_plottingData %>%
+  mutate(DEGs = Up + Down) %>%
+  separate(Comparison, c("V1","V2"), sep = "v", remove = FALSE) 
+
+#Same as above, but with LFC > 1 via treat
+tmp_plottingData <- rbind( 
+  summary(decideTests(tfit_CeA, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "CeA" ) %>%
+  rownames_to_column("Comparison"),
+  summary(decideTests(tfit_NAcc, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "NAcc" ) %>%
+  rownames_to_column("Comparison"),
+  summary(decideTests(tfit_PrL, method='global')) %>%
+  t() %>% 
+  as.data.frame.matrix() %>% 
+  select( "Down" , "Up" ) %>%
+  mutate( Region = "PrL" ) %>%
+  rownames_to_column("Comparison")
+)
+tmp_plottingData <- tmp_plottingData %>%
+  mutate( SigDEGs = Up + Down,
+          SigUp = Up,
+          SigDown = Down ) %>%
+  select( SigDEGs, SigUp, SigDown, Comparison , Region )
+#Combine
+plottingData <- inner_join(tmp_plottingData, plottingData) 
+
+#This is based on a rough estimate of genetic distance (via LFC), using the
+#DE all data and B6 as the reference.
+tmp_geneticSimilarity<-c("B6","NZO","AJ","S129","NOD","WSB","PWK","CAST")
+plottingData$V1 <- factor(plottingData$V1, tmp_geneticSimilarity)
+plottingData$V2 <- factor(plottingData$V2, tmp_geneticSimilarity)
+
+#Individual plotting sets for stats. Building up the ratio of up/down genes,
+#scaling it from 50-100, and finding quartlies for % significant genes where
+#significant is LFG > 1.  We then map that to upper/middle 2/lower.
+#Remember v2 is the reference strain.  Logic for scaling is provided in the
+#plotting figure plotting.matchup, below.
+plottingData_B6<-plottingData[plottingData$V2=="B6",]
+plottingData_PWK<-plottingData[plottingData$V2=="PWK",]
+plottingData_CeA<-plottingData[plottingData$Region=="CeA",]
+plottingData_NAcc<-plottingData[plottingData$Region=="NAcc",]
+plottingData_PrL<-plottingData[plottingData$Region=="PrL",]
+
+plottingData_B6$DownRatio <- plottingData_B6$Down/plottingData_B6$DEGs * 100
+plottingData_B6$DEGscale <- plottingData_B6$DEGs - min(plottingData_B6$DEGs);
+plottingData_B6$DEGscale <- 
+  (plottingData_B6$DEGscale / max(plottingData_B6$DEGscale))*50+50
+tmp <- ntile(plottingData_B6$SigDEGs/plottingData_B6$DEGs,4)
+tmp <- mapvalues(tmp,from=c(1,2,3,4),to=c(1/3,2/3,2/3,1))
+plottingData_B6$SigDEGscale <-tmp
+
+plottingData_PWK$DownRatio <- plottingData_PWK$Down/plottingData_PWK$DEGs * 100
+plottingData_PWK$DEGscale <- plottingData_PWK$DEGs - min(plottingData_PWK$DEGs);
+plottingData_PWK$DEGscale <- 
+  (plottingData_PWK$DEGscale / max(plottingData_PWK$DEGscale))*50+50
+tmp <- ntile(plottingData_PWK$SigDEGs/plottingData_PWK$DEGs,4)
+tmp <- mapvalues(tmp,from=c(1,2,3,4),to=c(1/3,2/3,2/3,1))
+plottingData_PWK$SigDEGscale <-tmp
+
+plottingData_CeA$DownRatio <- plottingData_CeA$Down/plottingData_CeA$DEGs * 100
+plottingData_CeA$DEGscale <- plottingData_CeA$DEGs - min(plottingData_CeA$DEGs);
+plottingData_CeA$DEGscale <- 
+  (plottingData_CeA$DEGscale / max(plottingData_CeA$DEGscale))*50+50
+tmp <- ntile(plottingData_CeA$SigDEGs/plottingData_CeA$DEGs,4)
+tmp <- mapvalues(tmp,from=c(1,2,3,4),to=c(1/3,2/3,2/3,1))
+plottingData_CeA$SigDEGscale <-tmp
+
+plottingData_NAcc$DownRatio <- 
+  plottingData_NAcc$Down/plottingData_NAcc$DEGs * 100
+plottingData_NAcc$DEGscale <- 
+  plottingData_NAcc$DEGs - min(plottingData_NAcc$DEGs);
+plottingData_NAcc$DEGscale <- 
+  (plottingData_NAcc$DEGscale / max(plottingData_NAcc$DEGscale))*50+50
+tmp <- ntile(plottingData_NAcc$SigDEGs/plottingData_NAcc$DEGs,4)
+tmp <- mapvalues(tmp,from=c(1,2,3,4),to=c(1/3,2/3,2/3,1))
+plottingData_NAcc$SigDEGscale <-tmp
+
+plottingData_PrL$DownRatio <- plottingData_PrL$Down/plottingData_PrL$DEGs * 100
+plottingData_PrL$DEGscale <- plottingData_PrL$DEGs - min(plottingData_PrL$DEGs);
+plottingData_PrL$DEGscale <- 
+  (plottingData_PrL$DEGscale / max(plottingData_PrL$DEGscale))*50+50
+tmp <- ntile(plottingData_PrL$SigDEGs/plottingData_PrL$DEGs,4)
+tmp <- mapvalues(tmp,from=c(1,2,3,4),to=c(1/3,2/3,2/3,1))
+plottingData_PrL$SigDEGscale <-tmp
+
+#Cleanup
+rm(list=ls(pattern= "tmp", all.names = TRUE))
+```
+
+## High drinkers vs Low DE counts
+Build up a list of genes from the high vs low drinker individual differential 
+expression analysis
+```{r Build plotting data high versus low}
+#transcriptInfoMounse_EnsGene[, 2] is external_gene_name
+plottingData_DEGs_Drinkers <-
+  bind_rows( 
+    topTable(efit_drinkers_CeA[, "B6vsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "CeA",
+              strain = "B6",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]),
+    topTable(efit_drinkers_NAcc[, "B6vsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "NAcc",
+              strain = "B6",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]),
+    topTable(efit_drinkers_PrL[, "B6vsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "PrL",
+              strain = "B6",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]),
+    topTable(efit_drinkers_CeA[, "PWKvsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "CeA",
+              strain = "PWK",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]),
+    topTable(efit_drinkers_NAcc[, "PWKvsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "NAcc",
+              strain = "PWK",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]),
+    topTable(efit_drinkers_PrL[, "PWKvsLow"], n= Inf) %>%
+      filter( adj.P.Val < 0.05 ) %>%
+      select(logFC, adj.P.Val) %>% 
+      rownames_to_column(var="Ensembl_ID") %>%
+      mutate( direction = sign(logFC),
+              region = "PrL",
+              strain = "PWK",
+              symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]))
+```
+##Unique DEGs  
+
+The logic here finds common differentially expressed genes (using 'global' 
+methods for decideTests) across multiple comparisons. In particular we are
+counting the number of times in a given direction a gene is differentially 
+expressed between one strain and all the others. We are most interested in the
+'rare' case of a gene being up or down expressed between one strain and all 
+others (up/down=7), but that is arbitrary. Average log fold change and adj.P.Val
+are also calculated from all the comparison via topTables.  
+```{r Build plotting data common degs}
+tmp_CeA <- decideTests(efit_CeA, method='global') %>% data.frame()
+tmp_NAcc <- decideTests(efit_NAcc, method='global') %>% data.frame()
+tmp_PrL <- decideTests(efit_PrL, method='global') %>% data.frame()
+tmp_CeA$Symbol <- efit_CeA$genes$Symbol 
+tmp_NAcc$Symbol <- efit_NAcc$genes$Symbol
+tmp_PrL$Symbol <- efit_PrL$genes$Symbol
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+#Find common DEGS by strain. Choosing V1 or V2 here doesn't matter since they
+#have common factors.. the important choice is 'ends_with' below, which makes
+#sure we are selecting comparisons where "up" corresponds to "up" IN strain.
+#Remember that in the comparison language V1vV2 = V2 - V1 for reasons.
+for (strain in levels(plottingData_CeA$V1)) {
+  
+  #Count the number of times up and down
+  tmp_1 <- tmp_CeA %>% data.frame() %>%
+    select(ends_with(strain)) %>% 
+    mutate(up   = rowSums(.>0), #. is the data mask to the entire dataframe
+           down = rowSums(.<0),
+           region = "CeA",
+           strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind( tmp, 
+                tmp_1 %>% 
+                  count(up, down) %>%
+                  mutate(region = "CeA",
+                  strain = {{strain}}))
+  
+  #Tracking the genes.. computing mean FDR and LFC
+  tmp_4<-data.frame()
+  for (comparison in tmp_CeA %>% 
+       select(ends_with(strain)) %>%
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_CeA[, comparison], n= Inf) %>%
+      select(logFC, adj.P.Val)
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3)), ]
+    
+    if (length(tmp_4))
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  #Genes
+  tmp_1$Symbol <- tmp_CeA$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all( ~.x / 7) )
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                   rownames_to_column("Ensembl_ID") %>%
+                   select("Ensembl_ID",
+                          "Symbol",
+                          "region",
+                          "strain",
+                          "up",
+                          "down",
+                          "logFC",
+                          "adj.P.Val"))
+}
+
+plottingData_commonDEGs <- tmp_2
+plottingData_commonDEGs_count <- tmp
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+#Find common DEGS by strain. Choosing V1 or V2 here doesn't matter since they
+#have common factors.. the important choice is 'ends_with' below, which makes
+#sure we are selecting comparisons where "up" corresponds to "up" IN strain.
+for (strain in levels(plottingData_NAcc$V1)) {
+  
+  #Count the number of times up and down
+  tmp_1 <- tmp_NAcc %>% data.frame() %>%
+    select(ends_with(strain)) %>% 
+    mutate(up   = rowSums(.>0),
+           down = rowSums(.<0),
+           region = "NAcc" ,
+           strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind(tmp , 
+               tmp_1 %>% 
+                 count(up, down) %>%
+                 mutate(region = "NAcc",
+                 strain = {{strain}}))
+  
+  #Tracking the genes.. computing mean FDR and LFC
+  tmp_4<-data.frame()
+  for (comparison in tmp_NAcc %>% 
+       select(ends_with(strain)) %>%
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_NAcc[, comparison], n= Inf) %>%
+      select(logFC, adj.P.Val)
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3) ), ]
+    
+    if (length(tmp_4) )
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  #Genes
+  tmp_1$Symbol <- tmp_NAcc$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all( ~.x / 7))
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                   rownames_to_column("Ensembl_ID") %>%
+                   select("Ensembl_ID",
+                          "Symbol",
+                          "region",
+                          "strain",
+                          "up",
+                          "down",
+                          "logFC",
+                          "adj.P.Val"))
+}
+plottingData_commonDEGs <- rbind(tmp_2, plottingData_commonDEGs)
+plottingData_commonDEGs_count <- rbind(tmp, plottingData_commonDEGs_count)
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+#Find common DEGS by strain. Choosing V1 or V2 here doesn't matter since they
+#have common factors.. the important choice is 'ends_with' below, which makes
+#sure we are selecting comparisons where "up" corresponds to "up" IN strain.
+for (strain in levels(plottingData_PrL$V1)) {
+  
+  #Count the number of times up and down
+  tmp_1 <- tmp_PrL %>% data.frame() %>%
+    select(ends_with(strain)) %>% 
+    mutate(up   = rowSums(.>0) ,
+          down = rowSums(.<0) ,
+          region = "PrL" ,
+          strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind( tmp , 
+                tmp_1 %>% 
+                  count(up,down) %>%
+                  mutate(region = "PrL",
+                  strain = {{strain}} ) )
+  
+  #Tracking the genes.. computing mean FDR and LFC
+  tmp_4<-data.frame()
+  for (comparison in tmp_PrL %>% 
+       select(ends_with(strain) ) %>%
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_PrL[,comparison], n= Inf) %>%
+      select(logFC, adj.P.Val )
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3)), ]
+    
+    if (length(tmp_4))
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  #Genes
+  tmp_1$Symbol <- tmp_PrL$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all(~.x / 7))
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                    rownames_to_column("Ensembl_ID") %>%
+                    select("Ensembl_ID",
+                           "Symbol",
+                           "region",
+                           "strain",
+                           "up",
+                           "down",
+                           "logFC",
+                           "adj.P.Val"))
+}
+
+plottingData_commonDEGs <- rbind(tmp_2, plottingData_commonDEGs)
+plottingData_commonDEGs_count <- rbind(tmp, plottingData_commonDEGs_count)
+
+#Clean up temps
+rm(list = ls(pattern= "tmp", all.names = TRUE))
+rm(strain, comparison)
+```
+## Signature Genes
+
+This is similar to the above section, only we are considering PWK and B6 vs all
+for the purposes of building up a "Common Unique DEG" list.. i.e. what genes are
+different, in the same direction, between B6 and PWK and all other strains.. 
+this means we dont want to compare B6 and PWK to each other.  
+
+```{r Build plotting data signature genes}
+tmp_CeA <- decideTests(efit_CeA, method='global') %>% data.frame()
+tmp_NAcc <- decideTests(efit_NAcc, method='global') %>% data.frame()
+tmp_PrL <- decideTests(efit_PrL, method='global') %>% data.frame()
+tmp_CeA$Symbol <- efit_CeA$genes$Symbol 
+tmp_NAcc$Symbol <- efit_NAcc$genes$Symbol
+tmp_PrL$Symbol <- efit_PrL$genes$Symbol
+
+tmp_strains <- c("B6", "PWK")
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+for (strain in tmp_strains) {
+  
+  tmp_1 <- tmp_CeA %>% data.frame() %>%
+    select(ends_with(strain) &
+             !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+    mutate(up   = rowSums(.>0),
+           down = rowSums(.<0),
+           region = "CeA",
+           strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind( tmp, 
+                tmp_1 %>% 
+                  count(up, down) %>%
+                  mutate(region = "CeA",
+                  strain = {{strain}}))
+  
+  tmp_4<-data.frame()
+  for (comparison in tmp_CeA %>%
+       select(ends_with(strain) &
+              !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_CeA[, comparison], n= Inf) %>%
+      select(logFC, adj.P.Val)
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3)), ]
+    
+    if (length(tmp_4))
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  tmp_1$Symbol <- tmp_CeA$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all( ~.x / 6) )
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                   rownames_to_column("Ensembl_ID") %>%
+                   select("Ensembl_ID",
+                          "Symbol",
+                          "region",
+                          "strain",
+                          "up",
+                          "down",
+                          "logFC",
+                          "adj.P.Val"))
+}
+
+plottingData_commonDEGs_Drinkers <- tmp_2
+plottingData_commonDEGs_count_Drinkers <- tmp
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+for (strain in tmp_strains) {
+  
+  tmp_1 <- tmp_NAcc %>% data.frame() %>%
+    select(ends_with(strain) &
+             !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+    mutate(up   = rowSums(.>0),
+           down = rowSums(.<0),
+           region = "NAcc",
+           strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind( tmp, 
+                tmp_1 %>% 
+                  count(up, down) %>%
+                  mutate(region = "NAcc",
+                  strain = {{strain}}))
+  
+  tmp_4<-data.frame()
+  for (comparison in tmp_NAcc %>%
+       select(ends_with(strain) &
+              !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_NAcc[, comparison], n= Inf) %>%
+      select(logFC, adj.P.Val)
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3)), ]
+    
+    if (length(tmp_4))
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  tmp_1$Symbol <- tmp_NAcc$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all(~.x / 6))
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                   rownames_to_column("Ensembl_ID") %>%
+                   select("Ensembl_ID",
+                          "Symbol",
+                          "region",
+                          "strain",
+                          "up",
+                          "down",
+                          "logFC",
+                         "adj.P.Val"))
+}
+plottingData_commonDEGs_Drinkers <- 
+  rbind(tmp_2, plottingData_commonDEGs_Drinkers)
+plottingData_commonDEGs_count_Drinkers <-
+  rbind(tmp, plottingData_commonDEGs_count_Drinkers)
+
+tmp <- data.frame()
+tmp_2 <- data.frame()
+for (strain in tmp_strains) {
+  
+  tmp_1 <- tmp_PrL %>% data.frame() %>%
+    select(ends_with(strain) &
+             !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+    mutate(up   = rowSums(.>0),
+           down = rowSums(.<0),
+           region = "PrL",
+           strain = {{strain}}) 
+  
+  #Counts by up/down
+  tmp <- rbind( tmp, 
+                tmp_1 %>% 
+                  count(up, down) %>%
+                  mutate(region = "PrL",
+                  strain = {{strain}}))
+  
+  tmp_4<-data.frame()
+  for (comparison in tmp_PrL %>%
+       select(ends_with(strain) &
+              !starts_with(tmp_strains[tmp_strains != strain])) %>% 
+       colnames()) {
+    
+    tmp_3 <- topTable(efit_PrL[, comparison], n= Inf) %>%
+      select(logFC, adj.P.Val)
+    tmp_3 <- tmp_3[match(rownames(tmp_1), rownames(tmp_3)), ]
+    
+    if (length(tmp_4))
+      tmp_4 <- tmp_4 + tmp_3
+    else
+      tmp_4 <- tmp_3
+    
+  }
+  
+  tmp_1$Symbol <- tmp_PrL$Symbol
+  tmp_1 <- tmp_1 %>%
+    bind_cols(tmp_4 %>% mutate_all(~.x / 6))
+  tmp_2 <- rbind(tmp_2 ,
+                 tmp_1 %>%
+                   rownames_to_column("Ensembl_ID") %>%
+                   select("Ensembl_ID",
+                          "Symbol",
+                          "region",
+                          "strain",
+                          "up",
+                          "down",
+                          "logFC",
+                         "adj.P.Val"))
+}
+plottingData_commonDEGs_Drinkers <- 
+  rbind( tmp_2, plottingData_commonDEGs_Drinkers )
+plottingData_commonDEGs_count_Drinkers <- 
+  rbind(tmp, plottingData_commonDEGs_count_Drinkers )
+
+#Clean up temps
+rm(list=ls(pattern= "tmp", all.names = TRUE))
+rm(strain,comparison)
+```
+
+## Phlogeny Distance  
+
+```{r distance for phlogeny}
+#Building up absolute 2-fold change distance for all pairwise comparisons.
+#This will give us a rough measure of genetic similarity for the strains 
+#We use manhattan distance here since logFC is already a nonlinear measure
+tmp_geneticSimilarity<-c("B6","NZO","AJ","S129","NOD","WSB","PWK","CAST")
+
+tmp <- data.frame(colSums(abs(topTable(efit_CeA, n = Inf)[, 3:58]))) 
+colnames(tmp)<-"distance"
+tmp$comparison <- rownames(tmp)
+plottingData_CeA_distance <- tmp
+plottingData_CeA_distance <- plottingData_CeA_distance %>% 
+  separate(comparison,c("V1", "V2"), sep = "v")
+plottingData_CeA_distance$V1 <- 
+  factor(plottingData_CeA_distance$V1, tmp_geneticSimilarity)
+plottingData_CeA_distance$V2 <- 
+  factor(plottingData_CeA_distance$V2, tmp_geneticSimilarity)
+plottingData_CeA_distance <- plottingData_CeA_distance %>% 
+  spread(V2, distance, fill = 0) %>% column_to_rownames(var = "V1")
+
+tmp <- data.frame(colSums(abs(topTable(efit_NAcc,n=Inf)[, 3:58])))
+colnames(tmp)<-"distance"
+tmp$comparison <- rownames(tmp)
+plottingData_NAcc_distance <- tmp
+plottingData_NAcc_distance <- plottingData_NAcc_distance %>% 
+  separate(comparison,c("V1", "V2"), sep = "v")
+plottingData_NAcc_distance$V1 <- 
+  factor(plottingData_NAcc_distance$V1, tmp_geneticSimilarity)
+plottingData_NAcc_distance$V2 <- 
+  factor(plottingData_NAcc_distance$V2, tmp_geneticSimilarity)
+plottingData_NAcc_distance <- plottingData_NAcc_distance %>% 
+  spread(V2, distance, fill = 0) %>% column_to_rownames(var = "V1")
+
+tmp <- data.frame(colSums(abs(topTable(efit_PrL, n = Inf)[, 3:58])))
+colnames(tmp)<-"distance"
+tmp$comparison <- rownames(tmp)
+plottingData_PrL_distance <- tmp
+plottingData_PrL_distance <- plottingData_PrL_distance %>%
+  separate(comparison,c("V1", "V2"), sep = "v")
+plottingData_PrL_distance$V1 <- 
+  factor(plottingData_PrL_distance$V1, tmp_geneticSimilarity)
+plottingData_PrL_distance$V2 <- 
+  factor(plottingData_PrL_distance$V2, tmp_geneticSimilarity)
+plottingData_PrL_distance <- plottingData_PrL_distance %>%
+  spread(V2, distance, fill = 0) %>% column_to_rownames(var = "V1")
+
+#Cleanup
+rm(list=ls(pattern= "tmp", all.names = TRUE))
+```
+
+## High Drinker  
+Unique DEGs: This data was generated above in the Unique DEGs plotting data 
+section, here I'm interested in the overlap between B6 vs other and PWK vs 
+others (not including B6vPWK and PWKvB6).  
+```{r}
+tmp_list = list()
+#Find genes expressed in same direction for both PWK and B6.. filter to max (6),
+#summarise mean by region/gene 
+tmp_plottingData <- plottingData_commonDEGs_Drinkers %>% 
+  filter(up == 6 | down == 6) %>%
+  group_by(region,Ensembl_ID, Symbol) %>% 
+  summarise_if(is.numeric, sum) %>% 
+  ungroup() 
+
+#summaries by region, type
+tmp_plottingData %>% 
+  group_by(region , up, down) %>%
+  count() #%>% clipr::write_clip()
+
+#sumamries by region
+plottingData_commonDEGs_Drinkers %>% 
+  filter(up == 6 | down == 6) %>%
+  mutate(direction = ifelse(up == 6, 1, -1)) %>%
+  group_by(region, strain) %>%
+  count(direction)# %>% clipr::write_clip()
+
+for (region in c("CeA", "NAcc", "PrL")) {
+  
+      #We used sum above, so 12 is the same direction, correct logFC and
+      #fdr to averages rather than sum
+      tmp_list[[paste0(region, "-common")]] <- tmp_plottingData %>%
+      filter(region == {{region}} &
+               (up == 12 | down == 12)) %>%
+      mutate(direction = ifelse(up == 12, 1, -1),
+             logFC = logFC / 2,
+             adj.P.Val = adj.P.Val / 2) %>%
+      select("Ensembl_ID", 
+             "Symbol",
+             "direction",
+             "logFC",
+             "adj.P.Val")
+      
+      #We used sum above, so 6/6 means opposite direction, correct logFC and
+      #fdr to averages rather than sum
+      tmp_list[[paste0(region, "-opposite")]] <- tmp_plottingData %>%
+      filter(region == {{region}} &
+               (up == 6 & down == 6)) %>%
+      mutate(logFC = logFC / 2,
+             adj.P.Val = adj.P.Val / 2) %>%
+      select("Ensembl_ID", 
+             "Symbol",
+             "logFC",
+             "adj.P.Val")  
+      
+      tmp_list[[paste0(region, "-B6")]] <- plottingData_commonDEGs_Drinkers %>%
+      filter(region == {{region}} &
+             strain == "B6" & 
+               (up == 6 | down == 6)) %>%
+      mutate(direction = ifelse( up == 6, 1, -1)) %>%
+      select("Ensembl_ID", 
+             "Symbol",
+             "direction",
+             "logFC",
+             "adj.P.Val")
+      
+      tmp_list[[paste0(region, "-PWK")]] <- plottingData_commonDEGs_Drinkers %>%
+      filter(region == {{region}} &
+             strain == "PWK" & 
+               (up == 6 | down == 6)) %>%
+      mutate(direction = ifelse( up == 6, 1, -1)) %>%
+      select("Ensembl_ID", 
+             "Symbol",
+             "direction",
+             "logFC",
+             "adj.P.Val")
+}
+
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Plotting Functions  
+
+```{r JQA Graphing functions}
+
+# JQA - 4/19/2022
+# Heavily inspired by the visualization work of Micah Blake McCurdy 
+# of Hockeyviz.com and Sam Ventura and Andrew Thomas of waronice.com.
+# Draws two triangles covering a portion of a square.  Overall scale
+# and opacity can be adjusted, allowing for three factors to be displayed 
+# visually in a single heat-map style tile.  
+# 	- Opacity differences become easily noticable by eye at 60% (when compared
+#	    to 100%). Every 10% after that is also easily differentiable
+#   - Overall scales below 50% make the other two factors hard to visualize
+# Inputs an array (so we can use lapply) of up to size 3
+#	    ratio		- volume ratio (%) of square covered by triangle			
+#				        (required)
+#     scale		- scaling ratio (%) of the size of square and triangle		
+#			  	      (optional - default = 100%)
+#     opacity - overall opacity of graph							    
+#               (optional - default = 100%)
+plot.matchup <- function(input) {
+  
+  arraySize = length(input);
+  scale <- 100;
+  opacity <- 100;
+  ratio<-input[1];
+  
+  if(arraySize == 3)  opacity <- input[3];
+  if(arraySize >= 2)  scale <- input[2];
+  
+  #Determine the top and bottom of the square based on scaling
+  top		<- 	1 + (scale / 100) / 2;
+  bottom	<- 	1 - (scale / 100) / 2;
+
+  #Unfortunately we can not simply draw one triangle and a square, then swap
+  #the colors - this results in different effects when using opacity as a 
+  #factor
+  if( ratio <= 50 )
+  {
+	  #Solve for the side of the right triangle given its coverage ratio of the
+    #square's area (a^2/2=square*ratio)
+    delta	<-	sqrt((scale / 100) ** 2 * 2 * ratio / 100);
+    #Polygon to meet up with triangle (Upper right)
+    polygon.x <- c(bottom+delta, top, top, bottom, bottom)
+    polygon.y <- c(bottom, bottom, top, top, bottom+delta)
+    #Triangle (Lower left)
+    triangle.x <- c(bottom, bottom, bottom+delta)
+    triangle.y <- c(bottom+delta, bottom,bottom)
+    fill.values <- c("red","blue")
+  } else
+  {
+	# We swap the color indexes for this case
+	# See above, but for a triangle based in the upper right with a coverage
+	# of (100-ratio)
+    delta<-sqrt((scale / 100) ** 2 * 2 * (100 - ratio) / 100);
+	  #Polygon to meet up with triangle (Lower left)
+    polygon.x <- c(bottom, bottom, top-delta, top, top)
+    polygon.y <- c(bottom, top, top, top-delta, bottom)
+    #Triangle (Upper right)
+    triangle.x <- c(top-delta, top, top)
+    triangle.y <- c(top, top ,top-delta)
+    fill.values <- c("blue", "red")
+  }
+  tmp<-ggplot()+
+	geom_polygon(inherit.aes = FALSE, show.legend = FALSE, alpha=opacity,
+		aes(x = polygon.x, y = polygon.y, fill = factor(1))) + 
+	geom_polygon(inherit.aes = FALSE, show.legend = FALSE, alpha=opacity,
+		aes(x = triangle.x, y = triangle.y, fill = factor(2))) +
+	scale_fill_manual(values = fill.values) +
+  
+  theme_void() +
+  xlim(0.5, 1.5)+
+  ylim(0.5, 1.5)+
+  coord_fixed()
+  theme(panel.border = element_rect(color = "black",fill = NA)) +
+	theme(plot.margin = unit(c(-0.5, 0, -0.5, 0), "cm"))
+  
+  return(tmp)
+}
+
+#JQA - 5/17/2022
+#See above for initial reasoning and attributions for this plot design
+#Here we are finalizing the plot so that standardized data can be provided
+#to it.  This draws circles / individual pie charts instead of triangles
+#Data needs: Up, Down, DEGs (up+down), SigDegs and columns 
+plot.matchup_new <- function(data) {
+
+#We calculate the ratio's internally so that data can be provided as 
+#slices for the full data set, if desired.
+data$DownRatio <- data$Down/data$DEGs * 100
+data$DEGscale <- data$DEGs - min(data$DEGs);
+data$DEGscale <- (data$DEGscale / max(data$DEGscale)) * 50 + 50
+tmp <- ntile(data$SigDEGs / data$DEGs, 4)
+tmp <- mapvalues(tmp,from = c(1, 2, 3, 4), to = c(0.3, 0.6, .6, 1))
+data$SigDEGscale <-tmp
+
+ggplot(data) + 
+  geom_rect(aes(xmin = 0, xmax = DEGscale / 100, 
+                ymin = 0, ymax = DownRatio/100 ,
+                fill = factor(1), alpha = SigDEGscale / 100  ) ) +
+  geom_rect(aes(xmin = 0 , xmax = DEGscale / 100, 
+                ymin = DownRatio / 100, ymax=  1,
+                fill = factor(2), alpha = SigDEGscale / 100 ) )+
+  coord_polar("y", direction = -1, start = pi / 2) +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_void()+
+  theme(legend.position="none")
+}
+
+#JQA - 5/17/2022
+#Make custom legend for plot.matchup_new to explain the way each factor is
+#visualized
+#Flag == 0 - Use general legend titles ('more')
+#Flat == 1 - Use numerical legend titles
+plot.matchup_legend <- function(data = 0 , flag = 0) {
+ 
+if(flag == 0)
+{
+  DEG_Label <- c("More DEGs", "Average DEGs", "Few DEGs")
+  SigDeg_Label <- c("High % Sig. DEGs",
+                    "Average % Sig. DEGs", "Low % Sig. DEGs")
+} else {
+  #We calculate the ratio's internally so that data can be provided as 
+  #slices for the full data set, if desired.
+  data$DownRatio <- data$Down / data$DEGs * 100
+  data$DEGscale <- data$DEGs - min(data$DEGs);
+  data$DEGscale <- (data$DEGscale / max(data$DEGscale)) * 50 + 50
+  tmp <- ntile(data$SigDEGs / data$DEGs, 4)
+  tmp <- mapvalues(tmp, from = c(1, 2, 3, 4), to = c(1/3, 2/3, 2/3, 1))
+  data$SigDEGscale <-tmp
+  DEG_Label = c( paste(round(max(data$DEGs), -2),"DEGs"),
+                 paste(round(mean(data$DEGs), -2),"DEGs"),
+                 paste(round(min(data$DEGs), -2),"DEGs"))
+  tmp <- aggregate(data$SigDEGs / data$DEGs, list(data$SigDEGscale), FUN = mean)
+  tmp <- paste("~", round(tmp[, 2] * 100, 1), "%", sep = "")
+  SigDeg_Label <- c(paste(tmp[3], "Sig. DEGs"),
+                    paste(tmp[2], "Sig. DEGs"),
+                    paste(tmp[1], "Sig. DEGs") )
+  SigDeg_Label <- c(paste(tmp[3], "hDEGs"),
+                    paste(tmp[2], "hDEGs"),
+                    paste(tmp[1], "hDEGs") )
+}
+
+tmp<-setNames(data.frame(  
+  c(100, 75, 50), 
+  c(50 ,50, 50), 
+  c(1, 1 , 1), 
+  factor(DEG_Label, DEG_Label)), 
+  c("DEGscale", "DownRatio", "SigDEGscale", "V1"))    
+MatchupLegend.1 <- ggplot(tmp) + 
+  geom_rect(aes(xmin = 0, xmax = DEGscale / 100, 
+                ymin = 0, ymax = DownRatio / 100,
+                fill = factor(1), alpha = SigDEGscale))+
+  geom_rect( aes(xmin = 0 , xmax = DEGscale / 100, 
+                 ymin = DownRatio / 100, ymax = 1,
+                 fill = factor(2), alpha = SigDEGscale))+
+  coord_polar("y", direction = -1, start = pi / 2) +
+  xlim(0, 1) +
+  #coord_equal() +
+  facet_grid(rows = vars(V1)) +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_void() +
+  theme(legend.position = "none") +
+	theme(panel.spacing = unit(-0.8, "lines")) +
+  theme(strip.text.y.left = element_text(angle = 0)) +
+  theme(plot.margin = unit(c(0, 0, 0, 0), "cm"))
+
+tmp<-setNames(data.frame(  
+  c(75, 75, 75), 
+  c(75 ,50, 25), 
+  c(1, 1 ,1), 
+  factor(
+    c("75% Down", "50% Down", "25% Down"),
+    c("75% Down", "50% Down", "25% Down"))) , 
+    c("DEGscale", "DownRatio", "SigDEGscale", "V1")) 
+MatchupLegend.2 <- ggplot(tmp) + 
+  geom_rect(aes(xmin = 0, xmax = DEGscale / 100, 
+                ymin = 0, ymax = DownRatio / 100,
+                fill = factor(1), alpha = SigDEGscale))+
+  geom_rect( aes(xmin = 0 , xmax = DEGscale / 100, 
+                 ymin = DownRatio / 100 ,ymax = 1,
+                 fill = factor(2), alpha = SigDEGscale))+
+  coord_polar("y", direction = -1, start = pi / 2) +
+  xlim(0, 1) +
+  #coord_equal() +
+  facet_grid(rows = vars(V1)) +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_void() +
+  theme(legend.position = "none")+
+	theme(panel.spacing=unit(-0.8, "lines")) +
+  theme(strip.text.y.left = element_text(angle = 0)) +
+  theme(plot.margin = unit(c(0, -4, 0, -4), "cm"))
+
+tmp<-setNames(data.frame(  
+  c(75, 75, 75), 
+  c(50, 50, 50), 
+  c(1, 0.6, 0.3), 
+  factor(SigDeg_Label, SigDeg_Label)) , 
+  c("DEGscale", "DownRatio", "SigDEGscale", "V1")) 
+MatchupLegend.3 <- ggplot(tmp) +
+  geom_rect(aes(xmin = 0, xmax = DEGscale / 100, 
+                ymin = 0, ymax = DownRatio / 100,
+                fill=factor(1), alpha = SigDEGscale)) +
+  geom_rect(aes(xmin = 0 , xmax = DEGscale / 100, 
+                ymin = DownRatio / 100, ymax=1,
+                fill = factor(2), alpha = SigDEGscale)) +
+  coord_polar("y",direction=-1,start=pi/2) +
+  xlim(0, 1) +
+  #coord_equal() +
+  facet_grid(rows = vars(V1)) +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme_void() +
+  theme(legend.position = "none") +
+	theme(panel.spacing = unit(-0.8, "lines")) +
+  theme(strip.text.y.left = element_text(angle = 0)) +
+  theme(plot.margin = unit(c(0, -4, 0, -4), "cm")) 
+
+wrap_plots(arrangeGrob(MatchupLegend.1,left="LEGEND"),
+           MatchupLegend.2,
+           MatchupLegend.3,
+           nrow=1)  
+}
+```
+# Figures  
+
+All figures used in the manuscript, and in the supplemental.  Final figure work
+is done in inkscape/xfig, etc.
+
+## Figure 1 - All Regions  
+
+PCA on TMM normalized (limma/voom) bulk data #This uses "globals" voom.normalized and phenotype  
+
+```{r figure.1}
+# library(ggpubr)
+
+tmp_pcaRes <- prcomp(t(normalized_all))
+tmp_explainedVariance <- summary(tmp_pcaRes)$importance
+
+#Build a data frame
+tmp <- data.frame(tmp_pcaRes$x[,1:10]) %>%
+  mutate(BrainRegion = phenotype$BrainRegion,
+          Genotype = phenotype$Genotype)
+
+#Trend lines by BrainRegion
+tmpPlot.1 <- ggscatter(tmp, x = "PC1", y = "PC3",
+           color = "BrainRegion",
+           ellipse = TRUE,
+           mean.point = TRUE,
+           ellipse.level = 0.9,
+           ellipse.type = "norm",
+           ellipse.alpha = 0.1,
+           ellipse.border.remove = TRUE,
+           theme = theme_classic(),
+           add = "reg.line"
+           ) + 
+   stat_cor(aes( 
+     color=BrainRegion,
+     label=paste(..rr.label.., ..p.label.., sep = "~`,`~" )))   +
+  xlab(paste("PC1 ", round(tmp_explainedVariance[2,1] * 100, 1), "%")) + 
+  ylab(paste("PC3 ", round(tmp_explainedVariance[2,3] * 100, 1), "%")) + 
+  labs(color = "Region", fill = "Region") + theme(legend.position = "right")
+
+# Here's how to do without ggpubr for the plotting.. but you still need it
+# to simply exctract the r^2 values.. but it does let you color things after
+# the fact, so you can have fewer trend lines if you wish
+tmpPlot.2 <- ggplot(tmp %>%
+          group_by(BrainRegion) %>% 
+          summarise_if(is.numeric, mean, na.rm = TRUE),
+          aes(PC1, PC3)) +
+ geom_point(aes(color = BrainRegion), size = 5) +
+ geom_smooth(method = lm, se = FALSE) +
+ stat_cor(aes(label = paste(..rr.label.., ..p.label.., sep = "~`,`~")),
+           label.x = 0.1) +
+ theme_classic() +
+  xlab(paste("PC1 ", round(tmp_explainedVariance[2,1] * 100, 1), "%")) + 
+  ylab(paste("PC3 ", round(tmp_explainedVariance[2,3] * 100, 1), "%")) + 
+ labs(color = "Region", fill = "region")
+
+#No trend lines
+tmpPlot.3 <-  ggscatter(tmp, x = "PC1", y = "PC3",
+           alpha = 0.75, shape = 16,
+           color = "BrainRegion",
+           ellipse = TRUE,
+           ellipse.level = 0.9,
+           ellipse.type = "norm",
+           ellipse.alpha = 0.1,
+           ellipse.border.remove = TRUE,
+           theme = theme_classic())  +
+  xlab(paste("PC1 ", round(tmp_explainedVariance[2,1] * 100, 1), "%")) + 
+  ylab(paste("PC3 ", round(tmp_explainedVariance[2,3] * 100, 1), "%")) + 
+  labs(color = "Region", fill = "Region") + theme(legend.position = "right")
+
+
+#There's no reason to do fittings on the genotype data.
+tmpPlot.4 <- ggscatter(tmp, x = "PC2", y = "PC4",
+           alpha = 0.75, shape = 16,
+           color = "Genotype",
+           ellipse = TRUE,
+           ellipse.level = 0.9,
+           ellipse.type = "norm",
+           ellipse.alpha = 0.1,
+           ellipse.border.remove = TRUE,
+           theme = theme_classic()) +
+  xlab(paste("PC2 ", round(tmp_explainedVariance[2,2] * 100, 1), "%")) + 
+  ylab(paste("PC4 ", round(tmp_explainedVariance[2,4] * 100, 1), "%")) + 
+  labs(color = "Strain", fill = "Strain") + theme(legend.position = "right")
+
+
+#no ellipse
+tmpPlot.5 <- ggscatter(tmp, x = "PC1", y = "PC3",
+           color = "BrainRegion",
+           theme = theme_classic()) + 
+  xlab(paste("PC1 ", round(tmp_explainedVariance[2,1] * 100, 1),"%")) + 
+  ylab(paste("PC3 ", round(tmp_explainedVariance[2,3] * 100, 1),"%")) + 
+  labs(color= "Region", fill = "Region") + theme(legend.position = "right")
+tmpPlot.6 <- ggscatter(tmp, x = "PC2", y = "PC4",
+           color = "Genotype",
+           theme = theme_classic()) + 
+  xlab(paste("PC2 ", round(tmp_explainedVariance[2,2] * 100, 1), "%")) + 
+  ylab(paste("PC4 ", round(tmp_explainedVariance[2,4] * 100, 1), "%")) + 
+  labs(color = "Strain", fill = "Strain") + theme(legend.position = "right")
+
+cat("Genotype is associated with PCs 2, 4, 5, 6, 8, 9, with total explained",
+    "variance: ", sum(tmp_explainedVariance[2, c(2, 4, 5, 6, 8, 9)] ), "\n")
+
+cat("Brain region is associated with PCs 1,3,7 with total explained variance: ",
+  sum(tmp_explainedVariance[2, c(1,3,7)] ), "\n")
+
+cat("Total explained variance associated with our category variables of",
+  "interest (Genotype and Brain region): ",
+  sum(tmp_explainedVariance[2, c(1, 2, 3, 4, 5, 6, 7, 8, 9, 10)] ),"\n" )
+
+#Variance by region
+tmp2 <- tmp %>%
+  group_by(BrainRegion) %>% 
+  summarise_if(is.numeric, var, na.rm = TRUE)
+tmp2 <- colMeans(tmp2[2:11])
+
+cat("Variance along PC1 by brain region:",
+     tmp2[1], "\n")
+cat("Variance along PC3 by brain region:",
+     tmp2[3], "\n")
+
+#Variance by genotype
+tmp3 <- tmp %>%
+  group_by(Genotype) %>% 
+  summarise_if(is.numeric, var, na.rm = TRUE)
+tmp3 <- colMeans(tmp3[2:11])
+cat("Variance along PC2 by genotype:" ,
+     tmp3[2], "\n")
+cat("Variance along PC4 by genotype:" ,
+     tmp3[4], "\n")
+
+#Trends
+tmpPlot <- (wrap_plots(tmpPlot.1, tmpPlot.2) +
+              plot_annotation(tag_levels = 'A'))
+tmpPlot & 
+  scale_color_brewer(palette = "Dark2") &
+  scale_fill_brewer(palette = "Dark2") #Color blind friendly palette
+
+if (saveFigs_Flag == 1) {
+  ggsave2("Figure_1_Suppliment.pdf",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1_Suppliment.svg",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1_Suppliment.eps",
+       width = 9, height = 3, units = "in")
+} #end if
+
+#With ellipses
+tmpPlot <- (wrap_plots(tmpPlot.3, tmpPlot.4) + 
+              plot_annotation(tag_levels = 'A'))
+tmpPlot & 
+  scale_color_brewer(palette = "Dark2") &
+  scale_fill_brewer(palette = "Dark2") #Color blind friendly palette
+
+if (saveFigs_Flag == 1) {
+  ggsave2("Figure_1_Ellipse.pdf",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1_Ellipse.svg",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1_Ellipse.eps",
+       width = 9, height = 3, units = "in")
+} #end if
+
+#Without ellipses
+tmpPlot <- (wrap_plots(tmpPlot.5, tmpPlot.6) +
+              plot_annotation(tag_levels = 'A'))
+tmpPlot & scale_color_brewer(palette = "Dark2") #Color blind friendly palette
+if (saveFigs_Flag == 1) {
+  ggsave2("Figure_1.pdf",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1.svg",
+       width = 9, height = 3, units = "in")
+  ggsave2("Figure_1.eps",
+       width = 9, height = 3, units = "in")
+} #end if
+
+#Cleanup temporary variables
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Figure 2 - CeA  
+
+Pairwise comparisons of the founder strains using the hockey plot and a 
+phlyogency. This uses "globals" plottingData.ceA, and plottingData.Cea.distance,
+plottingData.DEGs as well as the functions plot.matchup_new and 
+plot.matchup_legend  
+
+```{r figure.2}
+#library(gridExtra)
+#Unique DEGs
+tmp.plot <- plottingData_commonDEGs_count %>% 
+  filter(region == "CeA") %>%
+  filter(down == 7 | up == 7) %>%
+  group_by(strain) %>%
+  mutate(cumsum = cumsum(n),
+         sum = sum(n) ) %>%
+  ungroup() %>%
+  arrange(sum) %>%
+  mutate(up = factor(if_else(up==7, "Up", "Down"), c("Up", "Down")) ,
+         n_sign = if_else(up == "Up", n, -n) ,
+         strain = factor(strain, unique(strain))) 
+
+plotDesign<-paste0("AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "#BBBBB#\n",
+                   "#BBBBB#")
+
+tmpPlot.0 <- wrap_plots(plot.matchup_new(plottingData_CeA)+
+               facet_grid(facets = V2~V1, switch = "y") +
+               theme(strip.text = element_text(size = 12)),
+               plot.matchup_legend(plottingData_CeA, 1),
+               design = plotDesign)
+tmpPlot.1 <- ggdendrogram(hclust((plottingData_CeA_distance) %>% as.dist))+
+              theme(axis.text.y = element_blank())+
+              theme(axis.text.x = element_text(size = 12, 
+                                               color = c("darkmagenta",
+                                                         "darkmagenta",
+                                                         "darkmagenta",
+                                                         1, 1, 1, 1, 1)))
+
+tmpPlot.2 <- ggplot(tmp.plot) +
+  geom_col(aes(
+    x = strain,
+    y = n_sign,
+    fill = up ),
+    color="black") +
+  geom_text(data = tmp.plot %>% filter(n_sign < 0),
+            aes(
+              x = strain,
+              y = n_sign,
+              label = n), hjust = 1.1) +
+  geom_text(data = tmp.plot %>% filter(n_sign > 0),
+             aes(
+               x = strain,
+               y = n,
+               label = n), hjust = -0.1) +
+  theme_classic() +
+  scale_y_continuous(breaks = c(-500, -250, 0, 250, 500) ,
+                     limits = c(-550, 550) ,
+                     labels = c(500, 250, 0, 250, 500)) +
+  coord_flip() +
+  labs(fill="logFC Direction",y="# of unique DEGs",x="Strain")+
+  theme(axis.text.y = element_text(size = 12, 
+                                   color = c(1, 1, 1, 1, "darkmagenta",
+                                           1, "darkmagenta", "darkmagenta"))) +
+  theme(axis.text.x = element_text(size = 12)) +
+  theme(axis.title = element_text(size = 15), axis.title.y = element_blank()) +
+  scale_fill_manual(values = c("red", "blue"))
+
+
+tmpPlot.3 <- wrap_plots(tmpPlot.2, tmpPlot.1, ncol=1, heights = c(0.8, 0.2))
+
+tmpPlot <- wrap_plots(wrap_elements(tmpPlot.0), tmpPlot.3, widths = c(1, 0.5))+ 
+  plot_annotation(tag_levels = 'A')
+
+tmpPlot 
+
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_2_Pairwise_CeA.pdf",
+       width=15, height=9.3, units="in")
+  ggsave("Figure_2_Pairwise_CeA.eps",
+       width=15, height=9.3, units="in")
+  ggsave("Figure_2_Pairwise_CeA.svg",
+       width=15, height=9.3, units="in")
+} #end if
+
+#Cleanup temporary variables
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Figure 3 - NAcc  
+
+Pairwise comparisons of the founder strains using the hockey plot and a 
+phlyogency. This uses "globals" plottingData.NAcc, and 
+plottingData.NAcc.distance, plottingData.DEGs as well as the functions 
+plot.matchup_new and plot.matchup_legend  
+
+```{r figure.3}
+tmp_plot <- plottingData_commonDEGs_count %>% 
+  filter(region == "NAcc") %>%
+  filter(down == 7 | up == 7) %>%
+  group_by(strain) %>%
+  mutate(cumsum = cumsum(n),
+         sum = sum(n)) %>%
+  ungroup() %>%
+  arrange(sum) %>%
+  mutate(up = factor(if_else(up == 7, "Up", "Down"), c("Up", "Down")),
+         n_sign = if_else(up == "Up", n, -n),
+         strain = factor(strain, unique(strain))) 
+
+plotDesign <- paste0("AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "#BBBBB#\n",
+                   "#BBBBB#")
+tmpPlot.0 <- wrap_plots(plot.matchup_new(plottingData_NAcc) +
+                          facet_grid(facets = V2~V1, switch = "y") +
+                          theme(strip.text = element_text(size = 12)),
+                        plot.matchup_legend(plottingData_NAcc, 1),
+                        design = plotDesign)
+tmpPlot.1 <- ggdendrogram(hclust((plottingData_NAcc_distance) %>% as.dist)) +
+               theme(axis.text.y = element_blank()) +
+               theme( axis.text.x = element_text(size = 12, color = 
+                                                   c(1, 1, "darkmagenta", 
+                                                     "darkmagenta", 
+                                                     "darkmagenta", 1, 1, 1)))
+
+tmpPlot.2<-ggplot(tmp_plot) +
+  geom_col(aes( 
+    x = strain,
+    y = n_sign,
+    fill = up),
+    color="black") +
+  geom_text(data = tmp_plot %>% filter(n_sign < 0),
+             aes(x = strain,
+                 y = n_sign,
+                 label = n), hjust = 1.1) +
+  geom_text(data = tmp_plot %>% filter(n_sign > 0),
+             aes(x= strain,
+                 y = n,
+                 label = n), hjust = -0.1) +
+  theme_classic() +
+  scale_y_continuous(breaks = c(-500, -250, 0, 250, 500) ,
+                     limits = c(-550, 550) ,
+                     labels = c(500, 250, 0, 250, 500)) +
+  coord_flip() +
+  labs(fill = "logFC Direction", y = "# of unique DEGs", x = "Strain")+
+  theme(axis.text.y = element_text(size = 12, 
+                                   color = c(1, 1, 1, 1, "darkmagenta", 1,
+                                             "darkmagenta", "darkmagenta"))) +
+  theme(axis.text.x = element_text(size = 12)) +
+  theme(axis.title = element_text(size = 15), axis.title.y = element_blank()) +
+  scale_fill_manual(values = c("red", "blue"))
+
+tmpPlot.3 <- wrap_plots(tmpPlot.2, tmpPlot.1, ncol = 1, heights = c(0.8, 0.2))
+
+tmpPlot <- wrap_plots(wrap_elements(tmpPlot.0), tmpPlot.3, widths = c(1, 0.5)) +
+  plot_annotation(tag_levels = 'A')
+
+tmpPlot
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_3_Pairwise_NAcc.pdf",
+       width = 15, height = 9.3, units = "in")
+  ggsave("Figure_3_Pairwise_NAcc.eps",
+       width = 15, height = 9.3, units = "in")
+  ggsave("Figure_3_Pairwise_NAcc.svg",
+       width = 15, height = 9.3, units = "in")
+} #end if
+
+#Cleanup temporary variables
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+
+
+## Figure 4 - PrL   
+
+Pairwise comparisons of the founder strains using the hockey plot and a 
+phlyogency. This uses "globals" plottingData.PrL, and plottingData.PrL.distance,
+plottingData.DEGs as well as the functions plot.matchup_new and plot.matchup_legend  
+
+```{r figure.4}
+tmp_plot <- plottingData_commonDEGs_count %>% 
+  filter(region == "PrL") %>%
+  filter(down == 7 | up == 7) %>%
+  group_by(strain) %>%
+  mutate(cumsum = cumsum(n),
+         sum = sum(n)) %>%
+  ungroup() %>%
+  arrange(sum) %>%
+  mutate(up = factor(if_else(up == 7, "Up", "Down"), c("Up", "Down")),
+         n_sign = if_else(up == "Up", n, -n),
+         strain = factor(strain, unique(strain))) 
+
+plotDesign <- paste0("AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "AAAAAAA\n",
+                   "#BBBBB#\n",
+                   "#BBBBB#")
+tmpPlot_0 <- wrap_plots(plot.matchup_new(plottingData_PrL)+
+           facet_grid(facets = V2~V1, switch = "y") +
+           theme(strip.text = element_text(size = 12)),
+           plot.matchup_legend(plottingData_PrL, 1)
+           ,design = plotDesign)
+tmpPlot_1 <- ggdendrogram(hclust((plottingData_PrL_distance) %>% as.dist))+
+               theme(axis.text.y = element_blank())+
+              theme(axis.text.x = 
+                      element_text(size = 12, color = 
+                                     c(1, 1, "darkmagenta", "darkmagenta",
+                                       "darkmagenta", 1, 1, 1)))
+
+tmpPlot_2 <- ggplot(tmp_plot) +
+  geom_col(aes( 
+    x = strain,
+    y = n_sign,
+    fill = up),
+    color="black") +
+  geom_text(data = tmp_plot %>% filter(n_sign < 0),
+             aes(x = strain,
+                 y = n_sign,
+                 label = n), hjust = 1.1) +
+  geom_text(data = tmp_plot %>% filter(n_sign > 0),
+             aes(x= strain,
+                 y = n,
+                 label = n), hjust = -0.1) +
+  theme_classic()+
+  scale_y_continuous(breaks = c(-800, -400, 0, 300, 400),
+                     limits = c(-800, 800),
+                     labels = c(800, 400, 0, 400, 800)) +
+  coord_flip() +
+  labs(fill = "logFC Direction", y = "# of unique DEGs", x = "Strain") +
+  theme( axis.text.y = element_text(size = 12, 
+                                    color = c(1, 1, 1, 1, "darkmagenta", 1, 
+                                              "darkmagenta", "darkmagenta"))) +
+  theme(axis.text.x = element_text(size = 12)) +
+  theme(axis.title = element_text(size = 15), axis.title.y = element_blank()) +
+  scale_fill_manual(values = c("red","blue"))
+
+
+
+tmpPlot_3 <- wrap_plots(tmpPlot_2, tmpPlot_1, ncol=1, heights=c(0.8, 0.2))
+
+tmpPlot <- wrap_plots(wrap_elements(tmpPlot.0), tmpPlot_3, widths=c(1, 0.5))+
+  plot_annotation(tag_levels = 'A')
+
+tmpPlot
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_4_Pairwise_PrL.pdf",
+       width = 15, height = 9.3, units = "in")
+  ggsave("Figure_4_Pairwise_PrL.eps",
+       width = 15, height = 9.3, units = "in")
+  ggsave( "Figure_4_Pairwise_PrL.svg",
+       width=15,height=9.3 ,units="in" )
+} #end if
+
+#Cleanup temporary variables
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Figure 5 B6+PWK vs Rest  
+This uses plottingData_commonDEGs_Drinkers, which is analysis for B6 vs everyone
+but PWK, and PWK vs everyone vs B6: or high drinkers vs low drinkers 
+'individually'.  This data is generated by finding the unique DEGs using the 
+pairwise differential expression
+```{r VENNS for unique degs}
+
+tmp_up_B6 <- list( 
+  CeA = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           up == 6,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           up == 6,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           up == 6,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+tmp_down_B6 <- list( 
+  CeA = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           down == 6,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           down == 6,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "B6",
+           down == 6,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+wrap_plots( 
+  ggVennDiagram(tmp_down_B6, label="count", label_geom="text",
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position="none") + ggtitle("B6: Unique down genes") ,
+  ggVennDiagram(tmp_up_B6, label="count", label_geom="text",
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position="none") + ggtitle("B6: Unique up genes")
+   )
+
+##Get genes 
+venn<-Venn(tmp_up_B6)
+tmp<-process_data(venn)
+tmp_up_B6_common<-venn_region(tmp)[7, ]$item
+tmp_up_B6_common<-tmp_up_B6_common[[1]]
+venn<-Venn(tmp_down_B6)
+tmp<-process_data(venn)
+tmp_down_B6_common<-venn_region(tmp)[7, ]$item
+tmp_down_B6_common<-tmp_down_B6_common[[1]]
+
+
+plottingData_commonDEGs_Drinkers %>%
+  filter(strain == "B6",
+         Ensembl_ID %in% tmp_up_B6_common) %>%
+  group_by(Ensembl_ID) %>%
+  summarise_if(is.numeric, mean) %>%
+  mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+  select(Ensembl_ID, symbol, logFC, adj.P.Val)
+
+tmp_export <- list(
+B6_down = plottingData_commonDEGs_Drinkers %>%
+  filter(strain == "B6",
+         Ensembl_ID %in% tmp_down_B6_common) %>%
+  group_by(Ensembl_ID) %>%
+  summarise_if(is.numeric, mean) %>%
+  mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+  select(Ensembl_ID, symbol, logFC, adj.P.Val),
+B6_up = plottingData_commonDEGs_Drinkers %>%
+  filter(strain == "B6" ,
+         Ensembl_ID %in% tmp_up_B6_common) %>%
+  group_by(Ensembl_ID) %>%
+  summarise_if(is.numeric,mean) %>%
+  mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+  select(Ensembl_ID, symbol, logFC, adj.P.Val)
+)
+
+#PWK
+tmp_up_PWK <- list( 
+  CeA = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           up == 6,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           up == 6,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           up == 6,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+tmp_down_PWK <- list( 
+  CeA = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           down == 6,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           down == 6,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_commonDEGs_Drinkers %>%
+    filter(strain == "PWK",
+           down == 6,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+wrap_plots( 
+  ggVennDiagram(tmp_down_PWK, label="count", label_geom="text", 
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position="none") + ggtitle("PWK: Unique down genes") ,
+  ggVennDiagram(tmp_up_PWK, label="count", label_geom="text",
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position="none") + ggtitle("PWK: Unique up genes")
+   )
+
+
+##Get genes 
+venn<-Venn(tmp_up_PWK)
+tmp<-process_data(venn)
+tmp_up_PWK_common<-venn_region(tmp)[7,]$item
+tmp_up_PWK_common<-tmp_up_PWK_common[[1]]
+venn<-Venn(tmp_down_PWK)
+tmp<-process_data(venn)
+tmp_down_PWK_common<-venn_region(tmp)[7,]$item
+tmp_down_PWK_common<-tmp_down_PWK_common[[1]]
+
+tmp_export <- 
+  c(tmp_export,
+    list(
+      PWK_down = plottingData_commonDEGs_Drinkers %>%
+        filter(strain == "PWK",
+               Ensembl_ID %in% tmp_down_PWK_common) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val),
+      PWK_up = plottingData_commonDEGs_Drinkers %>%
+        filter(strain == "PWK",
+               Ensembl_ID %in% tmp_up_PWK_common) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+          select(Ensembl_ID, symbol, logFC, adj.P.Val)))
+
+# Down across all 3 regions in both high drinkers
+tmp_export <- 
+  c(tmp_export, 
+    list( 
+      down_both = plottingData_commonDEGs_Drinkers %>%
+        filter(Ensembl_ID %in% 
+                 intersect(tmp_down_PWK_common,tmp_down_B6_common)) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val),
+      up_both = plottingData_commonDEGs_Drinkers %>%
+        filter(Ensembl_ID %in% 
+                 intersect(tmp_up_PWK_common,tmp_up_B6_common)) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val)))
+
+#This is supplemental table 10
+if (exportTables_Flag == 1) {
+  write.xlsx(x = tmp_export, "UniqueDEGs_Common_Across_Region_B6_Pwk.xlsx")
+}#end if
+
+#Find common genes by region and direction
+tmp_plottingData <- plottingData_commonDEGs_Drinkers %>% 
+  filter(up == 6 | down == 6) %>%
+  group_by(region, Ensembl_ID, Symbol) %>% 
+  summarise_if(is.numeric, sum) %>% 
+  ungroup() 
+
+tmp_plottingData <- tmp_plottingData %>% 
+  filter( up == 12 | down == 12 ) %>%
+  mutate( up = ifelse(up == 12,"up","down")) %>%
+  group_by(region, up) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(n_sign = ifelse(up == "up", n, -n))
+
+#Manually adding in common rows from above list
+tmp_plottingData <-
+  tmp_plottingData %>%
+  add_row( region = "Common",
+           up = "up",
+           n = dim(tmp_export[["up_both"]])[1],
+           n_sign = dim(tmp_export[["up_both"]])[1]) %>%
+  add_row( region = "Common",
+           up = "down",
+           n = dim(tmp_export[["down_both"]])[1],
+           n_sign = -dim(tmp_export[["down_both"]])[1])
+
+tmp_plottingData$region <- 
+  factor(tmp_plottingData$region, rev(c("CeA", "NAcc", "PrL", "Common")))
+
+tmpPlot_1 <- ggVennDiagram(tmp_down_B6, 
+                           label = "count", 
+                           label_geom = "text", 
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position = "none") + ggtitle("B6 Down") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+tmpPlot_2 <- ggVennDiagram(tmp_up_B6, 
+                           label = "count", 
+                           label_geom = "text", 
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position = "none") + ggtitle("B6 Up") +
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_3 <- ggVennDiagram(tmp_down_PWK,
+                           label = "count",
+                           label_geom = "text",
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position = "none") + ggtitle("PWK Down") + 
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_4 <- ggVennDiagram(tmp_up_PWK,
+                           label = "count",
+                           label_geom = "text",
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position = "none") + ggtitle("PWK Up") + 
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_5 <- ggplot(tmp_plottingData) +
+  geom_col(aes(
+    x = region,
+    y = n_sign,
+    fill = up),
+    color="black") +
+  geom_text(data = tmp_plottingData %>% filter(n_sign < 0),
+            aes(
+              x = region,
+              y = n_sign,
+              label = n), hjust=1.1) +
+  geom_text(data = tmp_plottingData %>% filter(n_sign > 0),
+             aes(
+               x = region,
+               y = n,
+               label = n), hjust=-0.1) +
+  theme_classic() +
+  coord_flip() +
+  labs(fill="logFC Direction",y="# of signature DEGs",x="Strain")+
+  theme(axis.text.y = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) +
+  theme(axis.text.x = element_text(size = 15)) +
+  theme(axis.title = element_text(size = 15), axis.title.y = element_blank()) +
+  scale_fill_manual(values = c("#ffcc9c", "#c2d7f3")) +
+  ylim(-60, 60)
+
+plotDesign <- paste0("ABE\n",
+                     "CDE\n")
+wrap_plots( tmpPlot_1,
+            tmpPlot_2,
+            tmpPlot_3,
+            tmpPlot_4,
+            tmpPlot_5,
+            design = plotDesign) + plot_annotation(tag_levels = 'A')
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_5_Signature_DEGs.svg",
+      width = 12, height = 7, units = "in")
+} #end if
+
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+## Figure 6 B6+PWK vs Rest  
+This uses plottingData_DEGs_Drinkers, which is analysis for B6 vs everyone but 
+PWK, and PWK vs everyone vs B6: or high drinkers vs low drinkers 'individually'.
+This uses different expression for PWK and B6 vs low drinkers, individually.
+```{r VENNS for unique degs}
+
+tmp_up_B6 <- list( 
+  CeA = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == 1,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == 1,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == 1,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+tmp_down_B6 <- list( 
+  CeA = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == -1,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == -1,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "B6",
+           direction == -1,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+wrap_plots( 
+  ggVennDiagram(tmp_down_B6, label="count", label_geom="text", 
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position="none") + ggtitle("B6 vs Low: Down DEGs") ,
+  ggVennDiagram(tmp_up_B6, label="count", label_geom="text", 
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position="none") + ggtitle("B6 vs Low: Up DEGs")
+   )
+
+##Get genes 
+venn<-Venn(tmp_up_B6)
+tmp<-process_data(venn)
+tmp_up_B6_common<-venn_region(tmp)[7, ]$item
+tmp_up_B6_common<-tmp_up_B6_common[[1]]
+venn<-Venn(tmp_down_B6)
+tmp<-process_data(venn)
+tmp_down_B6_common<-venn_region(tmp)[7, ]$item
+tmp_down_B6_common<-tmp_down_B6_common[[1]]
+
+tmp_export <- list(
+B6_down = plottingData_DEGs_Drinkers %>%
+  filter(strain == "B6",
+         Ensembl_ID %in% tmp_down_B6_common) %>%
+  group_by(Ensembl_ID) %>%
+  summarise_if(is.numeric, mean) %>%
+  mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+  select(Ensembl_ID, symbol, logFC, adj.P.Val),
+B6_up = plottingData_DEGs_Drinkers %>%
+  filter(strain == "B6" ,
+         Ensembl_ID %in% tmp_up_B6_common) %>%
+  group_by(Ensembl_ID) %>%
+  summarise_if(is.numeric, mean) %>%
+  mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+  select(Ensembl_ID, symbol, logFC, adj.P.Val)
+)
+
+#PWK
+tmp_up_PWK <- list( 
+  CeA = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == 1,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == 1,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == 1,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+tmp_down_PWK <- list( 
+  CeA = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == -1,
+           region == "CeA") %>%
+    select(Ensembl_ID))[[1]],
+  NAcc = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == -1,
+           region == "NAcc") %>%
+    select(Ensembl_ID))[[1]],
+  PrL = (plottingData_DEGs_Drinkers %>%
+    filter(strain == "PWK",
+           direction == -1,
+           region == "PrL") %>%
+    select(Ensembl_ID))[[1]]
+  )
+
+wrap_plots( 
+  ggVennDiagram(tmp_down_PWK, label = "count", label_geom = "text", 
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position="none") + ggtitle("PWK: Unique down genes") ,
+  ggVennDiagram(tmp_up_PWK, label = "count", label_geom = "text", 
+                edge_lty = "blank")+
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position="none") + ggtitle("PWK: Unique up genes")
+   )
+
+
+##Get genes 
+venn<-Venn(tmp_up_PWK)
+tmp<-process_data(venn)
+tmp_up_PWK_common<-venn_region(tmp)[7,]$item
+tmp_up_PWK_common<-tmp_up_PWK_common[[1]]
+venn<-Venn(tmp_down_PWK)
+tmp<-process_data(venn)
+tmp_down_PWK_common<-venn_region(tmp)[7,]$item
+tmp_down_PWK_common<-tmp_down_PWK_common[[1]]
+
+tmp_export <- 
+  c(tmp_export,
+    list(
+      PWK_down = plottingData_DEGs_Drinkers %>%
+        filter(strain == "PWK",
+               Ensembl_ID %in% tmp_down_PWK_common) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val),
+      PWK_up = plottingData_DEGs_Drinkers %>%
+        filter(strain == "PWK" ,
+               Ensembl_ID %in% tmp_up_PWK_common) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+          select(Ensembl_ID, symbol, logFC, adj.P.Val)))
+
+# Down across all 3 regions in both high drinkers
+tmp_export <- 
+  c(tmp_export, 
+    list( 
+      down_both = plottingData_DEGs_Drinkers %>%
+        filter(Ensembl_ID %in% 
+                 intersect(tmp_down_PWK_common, tmp_down_B6_common)) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val),
+      up_both = plottingData_DEGs_Drinkers %>%
+        filter(Ensembl_ID %in% 
+                 intersect(tmp_up_PWK_common, tmp_up_B6_common)) %>%
+        group_by(Ensembl_ID) %>%
+        summarise_if(is.numeric, mean) %>%
+        mutate(symbol = transcriptInfoMouse_EnsGene[Ensembl_ID, 2]) %>%
+        select(Ensembl_ID, symbol, logFC, adj.P.Val)))
+
+#This is supplemental table 11
+if (exportTables_Flag == 1) {
+  write.xlsx(x = tmp_export, "LimmaVoom_Common_Across_Region_B6_Pwk.xlsx")
+} #end if
+
+#sumamries by region
+plottingData_DEGs_Drinkers %>% 
+  group_by(region,strain) %>%
+  count(strain) #%>% clipr::write_clip()
+
+#Find common genes by region and direction
+tmp_plottingData <- plottingData_DEGs_Drinkers %>% 
+  group_by(region, Ensembl_ID, symbol) %>% 
+  summarise_if(is.numeric, sum) %>% 
+  ungroup() 
+
+tmp_plottingData <- tmp_plottingData %>% 
+  filter(abs(direction) == 2) %>%
+  mutate(up = ifelse(direction == 2, "up", "down")) %>%
+  group_by(region, up) %>%
+  count() %>%
+  ungroup() %>%
+  mutate(n_sign = ifelse(up == "up", n, -n))
+
+#Manually adding in common rows from above list
+tmp_plottingData <-
+  tmp_plottingData %>%
+  add_row( region = "Common" ,
+           up = "up",
+           n = dim(tmp_export[["up_both"]])[1],
+           n_sign = dim(tmp_export[["up_both"]])[1]) %>%
+  add_row( region = "Common" ,
+           up = "down",
+           n = dim(tmp_export[["down_both"]])[1],
+           n_sign = -dim(tmp_export[["down_both"]])[1] )
+
+tmp_plottingData$region <- 
+  factor(tmp_plottingData$region, rev(c("CeA", "NAcc", "PrL", "Common")))
+
+tmpPlot_1 <- ggVennDiagram(tmp_down_B6, 
+                           label = "count", 
+                           label_geom = "text", 
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position = "none") + ggtitle("B6 Down") + 
+  theme(plot.title = element_text(hjust = 0.5))
+
+tmpPlot_2 <- ggVennDiagram(tmp_up_B6, 
+                           label = "count", 
+                           label_geom = "text", 
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position = "none") + ggtitle("B6 Up") +
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_3 <- ggVennDiagram(tmp_down_PWK,
+                           label = "count",
+                           label_geom = "text",
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Orange Light") +
+  theme(legend.position = "none") + ggtitle("PWK Down") + 
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_4 <- ggVennDiagram(tmp_up_PWK,
+                           label = "count",
+                           label_geom = "text",
+                           edge_lty = "blank") +
+  scale_fill_continuous_tableau(palette = "Blue Light") +
+  theme(legend.position = "none") + ggtitle("PWK Up") + 
+  theme(plot.title = element_text(hjust = 0.5))
+tmpPlot_5 <- ggplot(tmp_plottingData) +
+  geom_col(aes(
+    x = region,
+    y = n_sign,
+    fill = up ),
+    color="black") +
+  geom_text(data = tmp_plottingData %>% filter(n_sign < 0),
+            aes(
+              x = region,
+              y = n_sign,
+              label = n), hjust = 1.1) +
+  geom_text(data = tmp_plottingData %>% filter(n_sign > 0),
+             aes(
+               x = region,
+               y = n,
+               label = n), hjust = -0.1) +
+  theme_classic() +
+  coord_flip() +
+  labs(fill = "logFC Direction", y = "# of DEGs", x = "Strain")+
+  theme(axis.text.y = element_text(size = 15),
+        legend.text = element_text(size = 15),
+        legend.title = element_text(size = 15)) +
+  theme(axis.text.x = element_text(size = 15)) +
+  theme(axis.title = element_text(size = 15), axis.title.y = element_blank()) +
+  scale_fill_manual(values = c("#ffcc9c", "#c2d7f3")) +
+  ylim(-1100,1100)
+
+plotDesign <- paste0("ABE\n",
+                     "CDE\n")
+wrap_plots( tmpPlot_1,
+            tmpPlot_2,
+            tmpPlot_3,
+            tmpPlot_4,
+            tmpPlot_5,
+            design = plotDesign) + plot_annotation(tag_levels = 'A')
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_6_HiLo_DEGs.svg",
+       width = 12, height = 7, units = "in")
+} #end if
+
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+```
+
+##Figure S3
+```{r}
+
+tmpPlot_1 <-  ggbetweenstats(
+  data = statsPerSample_2,
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Sequencing Batch",
+  ylab = "Total Counts (Raw)",
+  ggtheme = theme_classic())
+
+tmpPlot_2 <- ggbetweenstats(
+  data = statsPerSample_2,
+  x = Sex,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Sex",
+  ylab = "Total Counts (Raw)",
+  ggtheme = theme_classic())
+
+tmpPlot_3 <- ggbetweenstats(
+  data = statsPerSample_2,
+  x = Genotype,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Strain",
+  ylab = "Total Counts (Raw)",
+  ggtheme = theme_classic())
+
+tmpPlot_4 <- ggbetweenstats(
+  data = statsPerSample_2,
+  x = BrainRegion,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Brain Region",
+  ylab = "Total Counts (Raw)",
+  ggtheme = theme_classic())
+
+wrap_plots( tmpPlot_1,
+            tmpPlot_2,
+            tmpPlot_3,
+            tmpPlot_4) + plot_annotation(tag_levels = 'A')
+if (saveFigs_Flag == 1) {
+ggsave("Figure_S3_Raw_Distros.svg",
+     width = 10, height = 10, units = "in")
+} #end if
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+
+```
+##Figure S4
+```{r}
+
+tmpPlot_1 <-  ggbetweenstats(
+  data = statsPerSample_3,
+  x = LibraryPrepBatch,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Sequencing Batch",
+  ylab = "Total Counts (TMM)",
+  ggtheme = theme_classic())
+
+tmpPlot_2 <- ggbetweenstats(
+  data = statsPerSample_3,
+  x = Sex,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Sex",
+  ylab = "Total Counts (TMM)",
+  ggtheme = theme_classic())
+
+tmpPlot_3 <- ggbetweenstats(
+  data = statsPerSample_3,
+  x = Genotype,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Strain",
+  ylab = "Total Counts (TMM)",
+  ggtheme = theme_classic())
+
+tmpPlot_4 <- ggbetweenstats(
+  data = statsPerSample_3,
+  x = BrainRegion,
+  y = sums,
+  pairwise.display = "significant",
+  p.adjust.method = "fdr",
+  results.subtitle = FALSE,
+  centrality.plotting = FALSE,
+  plot.type = "violin",
+  var.equal = TRUE,
+  xlab = "Brain Region",
+  ylab = "Total Counts (TMM)",
+  ggtheme = theme_classic())
+
+wrap_plots( tmpPlot_1,
+            tmpPlot_2,
+            tmpPlot_3,
+            tmpPlot_4) + plot_annotation(tag_levels = 'A')
+
+if (saveFigs_Flag == 1) {
+  ggsave("Figure_S4_TMM_Distros.svg",
+       width = 10, height = 10, units = "in")
+}
+rm(list = ls(pattern = "tmp", all.names = TRUE))
+
+```
+
+# Data export
+
+Information gathering and exporting
+
+## Supplemental Tables
+
+Code for generating all the supplemental tables
+```{r}
+#Table 1A, selected genes and their annotation
+data.frame( transcriptInfoMouse_EnsGene[rownames(geneCountsSelected), ] ) %>%
+  clipr::write_clip()
+
+#Table 1B, selected genes summarized by gene_biotype
+data.frame( transcriptInfoMouse_EnsGene[rownames(geneCountsSelected), ] ) %>%
+  group_by( gene_biotype ) %>%
+  count() %>%
+  clipr::write_clip()
+
+#Table 2A, dropped genes with reason
+bind_rows( list( nonchromosomal = droppedGenes_Nonchrom,
+                 lowcount = droppedGenes_Lowcount,
+                 highcount = droppedGenes_Highcount ),
+           .id = "id") %>% 
+  clipr::write_clip()
+
+#Table 2B, dropped genes summary counts by gene_biotype
+bind_rows( list( nonchromosomal = droppedGenes_Nonchrom,
+                 lowcount = droppedGenes_Lowcount,
+                 highcount = droppedGenes_Highcount ),
+           .id = "id") %>% 
+  group_by( gene_biotype ) %>%
+  count() %>%
+  clipr::write_clip()
+
+#CeA Tables (Supplemental 3)
+plottingData_CeA %>% 
+  select("V1", "V2", "Up") %>%
+  spread(V2, Up, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_CeA %>% 
+  select("V1", "V2", "Down") %>% 
+  spread(V2, Down, fill = 0) %>%
+  column_to_rownames(var = "V1") %>% 
+  clipr::write_clip()
+plottingData_CeA_distance %>%
+  clipr::write_clip()
+plottingData_CeA %>% 
+  select("V1", "V2", "SigUp") %>% 
+  spread(V2, SigUp, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_CeA %>% 
+  select("V1","V2","SigDown") %>% 
+  spread(V2, SigDown, fill=0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+
+#Tables 4(CeA), #8(NAcc), #9(PrL)
+#gene table for all unique genes by region and strain
+tmp_list = list()
+for (region in c("CeA" , "NAcc" , "PrL" )) {
+  for( strain in levels(plottingData_CeA$V1)) {
+    tmp_list[[paste0(region,"-",strain)]] <- plottingData_commonDEGs %>%
+      filter(region == {{ region }} &
+             strain == {{ strain }} &
+             ( up == 7 | down == 7 )) %>%
+      mutate( direction = ifelse(up == 7, 1, -1)) %>%
+      select("Ensembl_ID", 
+             "Symbol",
+             "direction",
+             "logFC",
+             "adj.P.Val")
+  }
+}
+library(openxlsx)
+if (exportTables_Flag == 1) {
+  write.xlsx(x = tmp_list,"HSCC_Founders_Unique_DEGs.xlsx")
+} #end if
+
+
+#NAcc Tables (Supplemental 6)
+plottingData_NAcc %>% 
+  select("V1", "V2", "Up") %>%
+  spread(V2, Up, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_NAcc %>% 
+  select("V1", "V2", "Down") %>% 
+  spread(V2, Down, fill = 0) %>%
+  column_to_rownames(var = "V1") %>% 
+  clipr::write_clip()
+plottingData_NAcc_distance %>%
+  clipr::write_clip()
+plottingData_NAcc %>% 
+  select("V1", "V2", "SigUp") %>% 
+  spread(V2, SigUp, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_NAcc %>% 
+  select("V1","V2","SigDown") %>% 
+  spread(V2, SigDown, fill=0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+
+
+#PrL Tables (Sup. 7)
+plottingData_PrL %>% 
+  select("V1", "V2", "Up") %>%
+  spread(V2, Up, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_PrL %>% 
+  select("V1", "V2", "Down") %>% 
+  spread(V2, Down, fill = 0) %>%
+  column_to_rownames(var = "V1") %>% 
+  clipr::write_clip()
+plottingData_PrL_distance %>%
+  clipr::write_clip()
+plottingData_PrL %>% 
+  select("V1", "V2", "SigUp") %>% 
+  spread(V2, SigUp, fill = 0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+plottingData_PrL %>% 
+  select("V1","V2","SigDown") %>% 
+  spread(V2, SigDown, fill=0) %>% 
+  column_to_rownames(var = "V1") %>%
+  clipr::write_clip()
+
+#table 10 is in Figure 5
+#table 11 is in figure 6
+```
+
+
+
