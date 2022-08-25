@@ -12,8 +12,7 @@ Additional differential expression results (computed via topTable) are also avai
   
 Everything else is already present in the supplemental tables available at the journal.
 
-Feel free to reach out if there is any other data you are interested in.
-Dr. Justin Anderson, andejust@ohsu.edu
+Feel free to reach out if there is any other data you are interested in please reach out to the corresponding author, Dr. Justin Anderson(andejust@ohsu.edu).
 
 
-Some DE results are available as GeneSets on GeneWeaver.  These are listed below:
+Many of the above DE results are available as GeneSets on GeneWeaver.  These are listed below:
