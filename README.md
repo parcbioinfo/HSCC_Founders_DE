@@ -1,5 +1,8 @@
 # HSCC_Founders_DE
-Differential expression (DE) analysis script for the HS-CC Founders strains. Script includes all figures produced for manscript as well as analysis.
+Differential expression (DE) analysis script for the HS-CC Founders manuscript published in the "Leveraging Genetic Diversity in Animal Models to Inform the Understanding of Human Disorders and Disease" special issue of "Frontiers in Behavorial Neuroscience". Script includes all figures produced for manscript as well as analysis.
+
+https://www.doi.org/10.3389/fnbeh.2022.992727 
+https://www.frontiersin.org/articles/10.3389/fnbeh.2022.992727
 
 Raw sequencing files (FASTQ), raw counts (STAR) and normalized counts (limma+voom TMM) are available from the Gene Expression Omnibus at accession ID GSE212000: https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE212000.  
 
